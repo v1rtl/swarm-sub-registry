@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master # Trigger on pushes to the master branch
+  pull_request:
+    branches:
+      - '**' # Trigger on pull requests targeting any branch
+
+env:
+  NODEJS_VERSION: '20'
+
+jobs:
+  check:
+    name: Check Code Quality & Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js and Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODEJS_VERSION }}
+          cache: 'yarn'
+
+      - name: Install Dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Check Formatting
+        run: yarn format:check
+
+      - name: Lint Code
+        run: yarn lint
+
+      - name: Compile Code
+        run: yarn compile
+
+      - name: Run Tests
+        run: yarn test

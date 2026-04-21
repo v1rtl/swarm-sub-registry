@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+
+# uv
+uv.lock
+
+# Ephemeral run state — never committed
+state/
+*.json.tmp
+
+# Anvil artefacts
+anvil.log
+anvil.pid
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

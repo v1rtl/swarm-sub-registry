@@ -1,0 +1,104 @@
+name: Codegen
+
+on:
+  push:
+    branches-ignore:
+      - '**'
+    tags:
+      - 'v*.*.*'
+env:
+  CODEGEN_ARTIFACTS: 'codegen_artifacts'
+  GO_CODEGEN_REPOSITORY: 'ethersphere/go-storage-incentives-abi'
+  ENV_CODEGEN_REPOSITORY: 'ethersphere/docker-setup-contracts'
+jobs:
+  generate-go:
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v2
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Get tag
+      id: tag
+      uses: dawidd6/action-get-tag@v1
+
+    - uses: actions/checkout@v2
+      with:
+        repository: ${{env.GO_CODEGEN_REPOSITORY}}
+        path: ${{env.CODEGEN_ARTIFACTS}}
+        persist-credentials: false
+        fetch-depth: 0
+        ref: master
+
+    - name: Generate files
+      run: |
+        readonly TARGET_DIR=${{env.CODEGEN_ARTIFACTS}}/abi
+        mkdir -p "${TARGET_DIR}"
+        ./codegen/generate_src.sh "${{steps.tag.outputs.tag}}" "go" "${TARGET_DIR}"
+
+    - name: Commit files
+      run: |
+        cd ${{env.CODEGEN_ARTIFACTS}}
+        git config --local user.email "bee-worker@ethswarm.org"
+        git config --local user.name "bee-worker"
+        git add .
+        git commit -m "generate code for smart contracts ${{steps.tag.outputs.tag}}"
+        git tag "${{steps.tag.outputs.tag}}"
+        git log --patch --max-count 1
+
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        repository: ${{env.GO_CODEGEN_REPOSITORY}}
+        directory: ${{env.CODEGEN_ARTIFACTS}}
+        github_token: ${{secrets.GHA_PAT_BASIC}}
+        branch: master
+        tags: true
+
+  generate-env:
+    if: contains(github.event.ref, '-rc')
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v2
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Get tag
+      id: tag
+      uses: dawidd6/action-get-tag@v1
+
+    - uses: actions/checkout@v2
+      with:
+        repository: ${{env.ENV_CODEGEN_REPOSITORY}}
+        path: ${{env.CODEGEN_ARTIFACTS}}
+        persist-credentials: false
+        fetch-depth: 0
+        ref: master
+
+    - name: Generate files
+      run: |
+        readonly TARGET_DIR=${{env.CODEGEN_ARTIFACTS}}
+        mkdir -p "${TARGET_DIR}"
+        ./codegen/generate_src.sh "${{steps.tag.outputs.tag}}" "env" "${TARGET_DIR}"
+
+    - name: Commit files
+      run: |
+        cd ${{env.CODEGEN_ARTIFACTS}}
+        git config --local user.email "bee-worker@ethswarm.org"
+        git config --local user.name "bee-worker"
+        git add .
+        git commit -m "generate code for smart contracts ${{steps.tag.outputs.tag}}"
+        git log --patch --max-count 1
+
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        repository: ${{env.ENV_CODEGEN_REPOSITORY}}
+        directory: ${{env.CODEGEN_ARTIFACTS}}
+        github_token: ${{secrets.GHA_PAT_BASIC}}
+        branch: master
+        tags: true

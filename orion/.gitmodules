@@ -1,0 +1,3 @@
+[submodule "vendor/storage-incentives"]
+	path = vendor/storage-incentives
+	url = https://github.com/ethersphere/storage-incentives.git
