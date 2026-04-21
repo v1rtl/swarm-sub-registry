@@ -13,15 +13,19 @@ from orion.constellation import Constellation, ContractSpec, Ref, RoleGrant
 
 
 NETWORK_ID = 1
-TOKEN_CAP = 10**12 * 10**16  # 10^12 BZZ at 16-decimal precision
 
+# TestToken constructor is (name, symbol, initialSupply). Decimals are
+# hardcoded to 16 in TestToken.sol via an override; there is no cap
+# argument — the deployer holds MINTER_ROLE and mints on demand. Initial
+# supply is 0 because participant provisioning does explicit mints
+# per label.
 SWARM = Constellation(
     name="swarm",
     contracts=[
         ContractSpec(
             name="Token",
             artifact="TestToken",  # NB: testnet, not mainnet Token
-            args=["BZZ", "BZZ", 16, TOKEN_CAP],
+            args=["BZZ", "BZZ", 0],
         ),
         ContractSpec(
             name="PostageStamp",
