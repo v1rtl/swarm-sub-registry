@@ -3,6 +3,10 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    # Pinned UID so dashboards can reference this datasource by
+    # {"uid": "prometheus"} without needing to be rewritten whenever
+    # Grafana regenerates auto-UIDs.
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
