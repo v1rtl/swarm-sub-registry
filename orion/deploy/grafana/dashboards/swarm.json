@@ -1,0 +1,170 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "orion-swarm",
+  "title": "Orion — Swarm Constellation",
+  "tags": ["orion", "swarm"],
+  "timezone": "",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {"from": "now-15m", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Block height",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_block_number", "refId": "A", "legendFormat": ""}
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value", "graphMode": "area"
+      },
+      "fieldConfig": {"defaults": {"decimals": 0}, "overrides": []}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Current round",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_swarm_current_round", "refId": "A", "legendFormat": ""}
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value", "graphMode": "none"
+      },
+      "fieldConfig": {"defaults": {"decimals": 0}, "overrides": []}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active phase",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_swarm_phase == 1", "refId": "A", "legendFormat": "{{phase}}"}
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background", "graphMode": "none",
+        "textMode": "name"
+      },
+      "fieldConfig": {"defaults": {"mappings": [], "color": {"mode": "thresholds"}}, "overrides": []}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "lastPrice (wei/chunkblock)",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_swarm_last_price_wei_per_chunkblock", "refId": "A", "legendFormat": ""}
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value", "graphMode": "area"
+      },
+      "fieldConfig": {"defaults": {"decimals": 0, "unit": "short"}, "overrides": []}
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Chain ID",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_chain_id_info", "refId": "A", "legendFormat": "{{chain_id}}"}
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "none", "graphMode": "none", "textMode": "name"
+      },
+      "fieldConfig": {"defaults": {}, "overrides": []}
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Redistribution pot (BZZ)",
+      "description": "orion_swarm_pot_wei / 10^16 (BZZ uses 16 decimals).",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_swarm_pot_wei / 1e16", "refId": "A", "legendFormat": "pot"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 6,
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "spanNulls": true}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Batch normalised balance (BZZ)",
+      "description": "Per-batch normalisedBalance scaled to BZZ.",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "orion_swarm_batch_normalised_balance_wei / 1e16",
+          "refId": "A",
+          "legendFormat": "{{label}} · {{batch_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "id": 20,
+      "type": "table",
+      "title": "Participants",
+      "description": "Per-participant effective stake, native balance, and token balance.",
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "orion_swarm_effective_stake_wei / 1e16", "refId": "A", "legendFormat": "stake BZZ", "format": "table", "instant": true},
+        {"expr": "orion_participant_native_balance_wei / 1e18", "refId": "B", "legendFormat": "native ETH", "format": "table", "instant": true},
+        {"expr": "orion_participant_token_balance_wei / 1e16", "refId": "C", "legendFormat": "BZZ", "format": "table", "instant": true}
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "profile": true},
+            "renameByName": {
+              "Value #A": "stake (BZZ)",
+              "Value #B": "native (ETH)",
+              "Value #C": "token (BZZ)",
+              "address": "address",
+              "label": "label"
+            }
+          }
+        }
+      ],
+      "options": {"showHeader": true},
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []}
+    }
+  ]
+}

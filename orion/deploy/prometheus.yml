@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s        # dev default; raise for long runs to reduce RPC load
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The orion metrics exporter runs on the host (`orion metrics serve
+  # --port 9464`). From inside the Prometheus container we reach the
+  # host via host.docker.internal, which is wired by the
+  # `extra_hosts: "host.docker.internal:host-gateway"` entry in
+  # docker-compose.yml on Linux.
+  - job_name: orion
+    static_configs:
+      - targets: ["host.docker.internal:9464"]
+        labels:
+          profile: swarm
