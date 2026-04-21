@@ -92,6 +92,37 @@ def chain_down() -> None:
     click.echo(f"anvil pid={c.pid} terminated  state/chain.json removed")
 
 
+@chain.command("auto-mine")
+@click.argument("seconds", type=float)
+def chain_auto_mine(seconds: float) -> None:
+    """Enable anvil interval mining at SECONDS per block.
+
+    Pass 0 to switch back to instamine (blocks only on tx submission or
+    explicit evm_mine). Common values:
+
+      \b
+      5  — Gnosis Chain-realistic (152 blocks/round ≈ 12.7 min)
+      1  — fast iteration (152 blocks/round ≈ 2.5 min)
+      0  — instamine (default; event-driven only)
+
+    Anvil's interval is an integer number of seconds; sub-second
+    intervals round to 0 (instamine). For faster-than-1s rounds, use
+    burst mining via ``Chain.mine(N)`` instead.
+
+    Live-switchable; no chain restart needed.
+    """
+    c = Chain.load(state_dir=DEFAULT_STATE_DIR)
+    c.set_interval_mining(seconds)
+    if seconds == 0:
+        click.echo("auto-mine OFF — back to instamine (blocks only on tx or evm_mine)")
+    else:
+        per_round_s = 152 * seconds
+        click.echo(
+            f"auto-mine ON — one block every {seconds}s "
+            f"(Redistribution round = 152 blocks ≈ {per_round_s:.1f}s)"
+        )
+
+
 # ─── Layer 2: constellation ──────────────────────────────────────────
 
 
