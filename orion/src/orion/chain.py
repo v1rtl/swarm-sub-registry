@@ -79,14 +79,19 @@ class Chain:
     ) -> "Chain":
         """Spawn a fresh anvil and return a Chain bound to it.
 
-        ``keep_running=True`` (default) leaves anvil alive across driver
-        exit; the caller or a future ``Chain.load(...).down()`` cleans up.
-        ``keep_running=False`` marks the process for a ``down()`` via a
-        with-statement — no atexit hook is registered (drivers composing
-        orion expect explicit lifecycle).
+        ``keep_running=True`` (default): anvil is put in its own process
+        group via ``start_new_session`` so it survives driver exit. The
+        caller (or a later ``Chain.load(...).down()``) must reap it.
+
+        ``keep_running=False``: anvil stays in the parent's session and
+        an :mod:`atexit` hook terminates it on process shutdown. Pair
+        with a context-manager pattern (``with Chain.up(...) as c: ...``)
+        for deterministic teardown — the atexit hook is a safety net
+        for crash paths, not the primary lifecycle.
         """
         proc = _spawn_anvil(
-            port=port, accounts=accounts, balance=balance, block_time=block_time
+            port=port, accounts=accounts, balance=balance,
+            block_time=block_time, detach=keep_running,
         )
         rpc = f"http://127.0.0.1:{port}"
         w3 = Web3(Web3.HTTPProvider(rpc))
@@ -99,6 +104,13 @@ class Chain:
         )
         chain._w3 = w3
         chain._save_state()
+
+        if not keep_running:
+            # Register a SIGTERM hook so the anvil dies if the driver
+            # exits without calling down() (e.g. on uncaught exception).
+            import atexit
+            atexit.register(_terminate_proc_silently, proc)
+
         return chain
 
     @classmethod
@@ -119,8 +131,20 @@ class Chain:
         return chain
 
     @classmethod
-    def load(cls, state_dir: Path = Path("state")) -> "Chain":
-        """Re-attach to the chain described by ``state_dir/chain.json``."""
+    def load(
+        cls,
+        state_dir: Path = Path("state"),
+        *,
+        require_connection: bool = True,
+    ) -> "Chain":
+        """Re-attach to the chain described by ``state_dir/chain.json``.
+
+        ``require_connection=True`` (default) raises if the RPC in the
+        state file is unreachable — appropriate for read/write paths
+        that need a live chain. Cleanup paths (``down``, ``orion down``)
+        pass ``False`` so they can reap stale state even when the chain
+        process has died or been killed out-of-band.
+        """
         path = state_dir / _CHAIN_STATE_FILENAME
         if not path.exists():
             raise RuntimeError(
@@ -128,7 +152,7 @@ class Chain:
             )
         data = _state.read(path)
         w3 = Web3(Web3.HTTPProvider(data["rpc"]))
-        if not w3.is_connected():
+        if require_connection and not w3.is_connected():
             raise RuntimeError(f"RPC at {data['rpc']} not reachable (chain gone?)")
         chain = cls(
             rpc=data["rpc"],
@@ -145,20 +169,29 @@ class Chain:
     def down(self) -> None:
         """Terminate the anvil we own (if any) and clear chain.json.
 
-        We own the process iff ``self.pid`` is set AND the pid points at
-        a live process. ``attach(..)`` chains always have ``pid=None`` and
-        are no-ops here. ``load(..).down()`` reaps a prior spawn-and-detach.
+        ``attach(..)`` chains have ``pid=None`` and are no-ops here.
+        ``load(..).down()`` reaps a prior spawn-and-detach. If the anvil
+        was spawned with ``keep_running=False`` (same session as the
+        parent), kill the single process; otherwise kill the whole
+        process group (standard detach-and-own path).
         """
         if self.pid is not None:
             try:
-                os.killpg(os.getpgid(self.pid), signal.SIGTERM)
+                proc_pgid = os.getpgid(self.pid)
             except ProcessLookupError:
+                proc_pgid = None
+            if proc_pgid is None:
                 pass  # already dead
-            except PermissionError:
-                # Different process group (e.g. session restart) — try a
-                # direct kill instead.
+            elif proc_pgid == os.getpgid(os.getpid()):
+                # Same session as us — plain kill, don't killpg (would
+                # also terminate the driver).
                 try:
                     os.kill(self.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                try:
+                    os.killpg(proc_pgid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
         path = self.state_dir / _CHAIN_STATE_FILENAME
@@ -243,14 +276,35 @@ class ImpersonationHandle:
 # ─── Private helpers ────────────────────────────────────────────────
 
 
+def _terminate_proc_silently(proc: subprocess.Popen) -> None:
+    """atexit helper: best-effort kill with no errors propagated."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+
+
 def _spawn_anvil(
     *,
     port: int,
     accounts: int,
     balance: int,
     block_time: Optional[float],
+    detach: bool = True,
 ) -> subprocess.Popen:
-    """Spawn anvil and block until its RPC is responsive. Raises on timeout."""
+    """Spawn anvil and block until its RPC is responsive. Raises on timeout.
+
+    ``detach=True`` puts anvil in its own session/process group so it
+    survives parent exit; ``down()`` then reaps it via ``killpg``.
+    ``detach=False`` leaves it in the parent's session so driver exit
+    delivers SIGHUP. Pair with atexit for proactive cleanup.
+    """
     cmd = [
         "anvil",
         "--port", str(port),
@@ -265,7 +319,7 @@ def _spawn_anvil(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        start_new_session=True,  # own process group → killpg works cleanly
+        start_new_session=detach,
     )
 
     deadline = time.time() + _ANVIL_SPAWN_TIMEOUT_S

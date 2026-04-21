@@ -82,8 +82,12 @@ def chain_attach(rpc: str) -> None:
 
 @chain.command("down")
 def chain_down() -> None:
-    """Terminate the anvil referenced in state/chain.json."""
-    c = Chain.load(state_dir=DEFAULT_STATE_DIR)
+    """Terminate the anvil referenced in state/chain.json.
+
+    Does NOT require the RPC to be reachable — a stale chain.json
+    pointing at a dead anvil can still be reaped.
+    """
+    c = Chain.load(state_dir=DEFAULT_STATE_DIR, require_connection=False)
     c.down()
     click.echo(f"anvil pid={c.pid} terminated  state/chain.json removed")
 
@@ -172,6 +176,34 @@ def participants_wipe() -> None:
     click.echo("participants.json removed (on-chain state untouched)")
 
 
+# ─── Metrics sidecar ────────────────────────────────────────────────
+
+
+@main.group()
+def metrics() -> None:
+    """Prometheus exporter (layer-optional)."""
+
+
+@metrics.command("serve")
+@click.option("--profile", required=True, help="Profile name; picks up orion.profiles.<name>_metrics.")
+@click.option("--port", default=9464, type=int, show_default=True)
+@click.option("--host", default="0.0.0.0", show_default=True,
+              help="Bind host. 127.0.0.1 for dev, 0.0.0.0 for docker/remote.")
+def metrics_serve(profile: str, port: int, host: str) -> None:
+    """Block serving Prometheus scrapes on http://host:port/metrics."""
+    from orion import metrics as _metrics  # local import — keeps prometheus_client off the hot path
+    c = Chain.load(state_dir=DEFAULT_STATE_DIR)
+    d = _read_deployment(DEFAULT_STATE_DIR)
+    click.echo(f"orion metrics → http://{host}:{port}/metrics  (profile={profile}, Ctrl-C to stop)")
+    try:
+        _metrics.serve(
+            chain=c, deployment=d, state_dir=DEFAULT_STATE_DIR,
+            profile=profile, port=port, host=host,
+        )
+    except KeyboardInterrupt:
+        click.echo("\nmetrics: shutting down")
+
+
 # ─── Priming ────────────────────────────────────────────────────────
 
 
@@ -213,6 +245,29 @@ def up(profile: str, artifacts: Optional[str], port: int) -> None:
     click.echo(f"profile '{d['profile']}' deployed — {len(d['contracts'])} contracts")
     for name, addr in d["contracts"].items():
         click.echo(f"  {name:15s} {addr}")
+
+
+@main.command("down")
+def down() -> None:
+    """Tear down everything: kill anvil, remove all state files.
+
+    Tolerant of stale state — still cleans up chain.json + deployment.json
+    + participants.json even if the RPC is already dead.
+    """
+    try:
+        c = Chain.load(state_dir=DEFAULT_STATE_DIR, require_connection=False)
+        c.down()
+        click.echo(f"anvil pid={c.pid} terminated")
+    except RuntimeError:
+        click.echo("no chain state — nothing to terminate")
+
+    # Remove residual state files the chain.down() didn't touch.
+    for name in ("deployment.json", "participants.json"):
+        path = DEFAULT_STATE_DIR / name
+        if path.exists():
+            path.unlink()
+            click.echo(f"removed {path}")
+    click.echo("teardown complete")
 
 
 @main.command("status")

@@ -9,6 +9,7 @@ dependencies = [
     "eth-hash[pycryptodome]>=0.7",
     "eth-keys>=0.5",
     "click>=8.1",
+    "prometheus-client>=0.20",
 ]
 
 [project.scripts]
