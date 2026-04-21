@@ -2,10 +2,7 @@
 
 `orion` composes a local EVM test environment from three independently
 reversible layers. Each layer has a narrow job and writes a state file
-that the next layer consumes. The layers and their boundaries are
-inherited wholesale from `../alectryon-harness/SKILLS.md` — that
-document is the generic playbook; this one describes how `orion`
-encodes the playbook as code.
+that the next layer consumes.
 
 ```
   ┌─────────────────────────────────────────────────────────┐
@@ -117,7 +114,7 @@ override with `--artifacts` or `$ORION_ARTIFACTS`.
 A funded participant is a signing identity with enough native currency
 to pay gas, enough protocol token to interact, and a role binding
 that makes them visible to the protocol. Orion implements the
-five-step pattern from `../alectryon-harness/docs/FUNDED_PARTICIPANTS.md`:
+canonical five-step pattern:
 
 ```
 1. derive signing key             ← the identity
@@ -184,33 +181,15 @@ by default — consumers call it explicitly because what counts as
 Orion gives you `Chain`, `deployment state`, and `participants`.
 Anything above that — round loops, event watchers, metrics — is
 downstream. Write your driver as a separate package/module that
-imports `orion`. See *Consumption model* below for
-`alectryon-harness`'s planned shape.
+imports `orion`.
 
-## Consumption model: alectryon-harness
+## Consumption model
 
-Once `orion` stabilises, `alectryon-harness/` compresses from
-"harness + machinery" down to "harness against orion":
-
-```
-alectryon-harness/                       orion/
-├── python/src/alectryon_harness/        ├── src/orion/
-│   ├── driver.py        ⇐ keeps         │   ├── chain.py
-│   ├── round.py         ⇐ keeps         │   ├── constellation.py
-│   ├── honest.py        ⇐ keeps         │   ├── participants.py
-│   ├── metrics.py       ⇐ keeps         │   ├── priming.py
-│   ├── artifacts.py     ⇒ deleted       │   ├── artifacts.py
-│   ├── deploy.py        ⇒ deleted       │   └── profiles/swarm.py
-│   ├── participants.py  ⇒ deleted       
-│   ├── bmt.py           ⇐ keeps (Technique-specific)
-│   └── stamp.py         ⇐ keeps until the kabashira gaps close
-└── foundry/contracts/                   
-```
-
-Import surface:
+Downstream drivers compose orion's four public entry points —
+`Chain`, `deploy_profile`, `provision`, `priming.*` — with their own
+protocol-specific logic:
 
 ```python
-# alectryon-harness driver after migration
 from orion import Chain, deploy_profile, provision, priming
 
 chain       = Chain.up(keep_running=True)
@@ -218,16 +197,21 @@ deployment  = deploy_profile(chain, profile="swarm")
 priming.set_postage_price(chain, deployment, wei_per_chunkblock=44_445)
 operator    = provision(chain, deployment, label="op-0", overlays=1)
 
-# Technique-specific code stays in alectryon-harness:
-play_alectryon_round(chain, deployment, operator, rust_binary=ALECTRYON_BIN, …)
+# protocol-specific driver code from here on — round loop, event
+# handlers, metrics, statistical tests, off-chain crypto, etc.
 ```
 
-Migration is incremental: `alectryon-harness` can start importing
-`orion.chain`, then `orion.constellation`, then `orion.participants`,
-one module at a time, without a flag day. The state-file shapes are
-chosen to match what `alectryon-harness` already writes
-(`state/deployment.json`, `state/participants.json`), so the first
-migration step is a drop-in replacement.
+Orion's state files (`state/chain.json`, `state/deployment.json`,
+`state/participants.json`) are the consumption contract. A driver
+can either keep an in-memory `Chain` object or re-load from the state
+files across invocations; both are first-class.
+
+Migrating an existing harness onto orion is incremental: replace your
+``deploy.py`` with ``from orion.constellation import deploy_profile``
+first, then your ``participants.py`` with ``from orion.participants
+import provision``, then your chain lifecycle. One module at a time,
+no flag day — the state-file shapes match what a hand-rolled harness
+typically already writes.
 
 ## Python package layout
 
@@ -256,8 +240,8 @@ orion/
   do not special-case in call sites.
 - P2P networking, libp2p, pullsync, hive. `../kabashira/` covers that;
   orion operates purely chain-side.
-- Real honest-node reserves at TB scale. Drivers that need such
-  reserves provide their own (e.g. alectryon-harness's synthetic
-  in-memory reserves).
+- Real protocol-scale data stores (TB-scale reserves, off-chain state
+  that a real node would maintain). Drivers that need such state
+  provide their own — orion is chain-side only.
 - Metrics and dashboards. Orion emits state and events; downstream
   consumers aggregate.

@@ -3,11 +3,7 @@
 End-to-end walkthrough: from zero to a locally-running Swarm
 constellation with a funded participant, ready for round driving.
 
-This doc assumes you're on Linux or macOS. If you're reading this
-while `orion` is still at the scaffold stage, some commands will
-`NotImplementedError` — the shape of each step is final; the
-implementations land as `alectryon-harness/` migrates onto orion. In
-the meantime, `../alectryon-harness/python/` is a working reference.
+This doc assumes you're on Linux or macOS.
 
 ## 1. Prerequisites
 
@@ -143,29 +139,32 @@ Under the hood this uses `anvil_impersonateAccount` on the
 call `PostageStamp.setPrice`, then releases the impersonation. No
 role-table modifications; the deployment remains mainnet-identical.
 
-## 6. Drive rounds
+## 6. Drive the protocol
 
-Round-driving is left to downstream consumers — orion provides the
-environment; the Technique or protocol-specific loop is elsewhere.
+Round-driving, event handlers, and any protocol-specific logic are
+out of orion's scope. Orion hands you `state/chain.json` +
+`state/deployment.json` + `state/participants.json`; a downstream
+driver consumes those and does whatever the protocol needs. Read the
+state from a driver with:
 
-For Swarm Redistribution specifically, raw `cast` works:
+```python
+from orion import Chain
+from pathlib import Path
+import json
 
-```bash
-REDIST=$(jq -r '.contracts.Redistribution' state/deployment.json)
-cast call $REDIST "currentRound()(uint64)" --rpc-url $(jq -r .rpc state/chain.json)
+chain = Chain.load()                                       # reads state/chain.json
+deployment = json.loads(Path("state/deployment.json").read_text())
+# your driver code here — round loops, event listeners, metrics, …
 ```
 
-For the Alectryon Technique round loop, use
-`../alectryon-harness/`:
+For ad-hoc chain inspection from the shell, `cast` talks to the same
+RPC:
 
 ```bash
-cd ../alectryon-harness/python
-uv run alectryon-run status
-uv run alectryon-run mine --blocks 152
+RPC=$(jq -r .rpc state/chain.json)
+ADDR=$(jq -r '.contracts.Redistribution' state/deployment.json)
+cast call $ADDR "currentRound()(uint64)" --rpc-url $RPC
 ```
-
-(After `alectryon-harness` migrates onto orion, those commands will
-import `orion` under the hood — but the CLI surface stays the same.)
 
 ## 7. Tear down / re-run
 
@@ -187,9 +186,8 @@ partition.
 
 - `ARCHITECTURE.md` — the three-layer model and extension points.
 - `ISSUES.md` — known pitfalls and limitations; read before debugging.
-- `../alectryon-harness/SKILLS.md` — the originating playbook; covers
-  material (troubleshooting trees, anvil RPC cheat sheet) that orion
-  doesn't yet have its own version of.
+- `WHY_PYTHON.md` — rationale for Python, scope of load-bearing
+  features vs auxiliary tools.
 
 ## Troubleshooting quick hits
 
@@ -200,4 +198,4 @@ partition.
 | `contract does not have any code` | wrong anvil (stale PID) or bad artifact prefix — see `ISSUES.md` |
 | second run's stakes are bigger than the first | role-binding call appends, not replaces — see `ISSUES.md:stake-accumulation` |
 
-Full tree in `../alectryon-harness/SKILLS.md:291`.
+More pitfall detail in `ISSUES.md`.

@@ -6,12 +6,11 @@ from pre-compiled Hardhat artifacts). The kit spins up an anvil node,
 deploys a "constellation" of contracts, provisions funded participants,
 and hands you a state bundle that downstream drivers can consume.
 
-`orion` is the extraction of the generic machinery that
-`alectryon-harness/` needed in order to test the Alectryon Technique
-against live Swarm bytecode. That harness was the first consumer; this
-repo is the reusable substrate. `alectryon-harness` will migrate to
-`orion` as an upstream once the public interface stabilises
-(see `ARCHITECTURE.md` for the consumption model).
+Orion is the chain-side substrate only: it does not know about round
+loops, off-chain cryptographic signatures, statistical aggregation, or
+any specific protocol's game mechanics. Drivers that need those
+compose orion with their own protocol-specific logic (see
+`ARCHITECTURE.md` §Consumption model for the expected shape).
 
 ## What you get
 
@@ -60,21 +59,21 @@ See `GETTING_STARTED.md` for the full walkthrough.
 
 ## Status
 
-This repo is a scaffold — documentation and module shape are in place,
-implementation lands incrementally as `alectryon-harness/` is migrated
-onto it. See `ISSUES.md` for known gaps.
+The four layers (chain, constellation, participants, priming) plus the
+CLI are implemented and smoke-tested against the reference Swarm
+profile. See `ISSUES.md` for known pitfalls and scope limits.
 
 | Layer | State |
 |---|---|
-| Documentation (README, ARCHITECTURE, GETTING_STARTED, ISSUES) | ✅ drafted |
-| Python package skeleton (`src/orion/`) | ✅ drafted |
+| Documentation (README, ARCHITECTURE, GETTING_STARTED, ISSUES, WHY_PYTHON) | ✅ |
+| Python package (`src/orion/`) | ✅ |
 | Vendored `storage-incentives` (pinned git submodule) | ✅ `vendor/storage-incentives/` |
-| Chain layer | ⏳ port from `alectryon-harness/python/src/alectryon_harness/deploy.py` |
-| Constellation layer | ⏳ port `deploy.py` + `artifacts.py` |
-| Participant layer | ⏳ port `participants.py` |
-| Priming helpers | ⏳ port `set_price` path |
-| Profile: Swarm | ⏳ encode `SWARM_CONSTELLATION.md` as data |
-| CLI | ⏳ stitch the above together |
+| Chain layer | ✅ spawn/attach/load/down, mine, snapshot/revert, impersonation |
+| Constellation layer | ✅ declarative deploy from Hardhat artifacts + role grants |
+| Participant layer | ✅ five-step derive/fund/mint/approve/role-bind |
+| Priming helpers | ✅ `set_postage_price` via PriceOracle impersonation |
+| Profile: Swarm | ✅ `profiles/swarm.py` — 5 contracts, 4 role grants |
+| CLI | ✅ all subcommands wired |
 
 ## Name
 

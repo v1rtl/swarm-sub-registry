@@ -199,28 +199,10 @@ Things orion explicitly does *not* do, and probably never will:
 
 ## Upstream gaps
 
-Things *other* repos are missing that complicate orion's or its
-consumers' lives. Tracked here so we can push fixes upstream when
-the opportunity arises.
-
-### kabashira: `bmt_merkle_path` missing
-
-Kabashira exposes BMT hashing but not merkle-path construction. The
-alectryon binary builds paths internally but doesn't emit them;
-`alectryon-harness` currently ports the algorithm to Python
-(`bmt.py`). Tracked in detail at
-`../kabashira/ALECTRYON_HARNESS_GAPS.md`. Not orion's problem
-directly — orion stops at the EVM boundary — but closing this gap is
-what lets `alectryon-harness` delete `bmt.py` entirely and treat
-kabashira as a black-box proof-emitter.
-
-### kabashira: postage stamp signing
-
-Kabashira's `SwarmSigner::sign` applies EIP-191 + keccak256, whereas
-postage stamps need EIP-191 applied over a pre-hashed 32-byte
-message. Also tracked at `../kabashira/ALECTRYON_HARNESS_GAPS.md`.
-Same story: orion is unaffected, but a `sign_stamp` helper in
-kabashira would let `alectryon-harness` delete `stamp.py`.
+Things in vendored repos that affect orion directly. Gaps that only
+affect downstream consumers (e.g. missing helpers in a protocol's
+client library) belong in those consumers' own issue trackers, not
+here.
 
 ### `storage-incentives`: mainnet Token artifact is a bridge shim
 
@@ -233,13 +215,3 @@ upstream repo layout. Orion's Swarm profile already defaults to
 `TestToken` (see `src/orion/profiles/swarm.py`). If the artifact
 loader is ever rewritten, preserve the "fall back to testnet/ for
 TestToken" behaviour.
-
-### Harness is mid-stage-3
-
-`../alectryon-harness/README.md:35` has a status table: commit and
-reveal land, claim reverts with empty logs. Suspect causes listed at
-`README.md:272`. Once diagnosed, may surface another priming gap
-(e.g. layer-3 transform salt requires a reveal phase that touches
-`currentRevealRoundAnchor`). If the fix is protocol-generic, it
-belongs in orion priming; if Technique-specific, in
-alectryon-harness.
