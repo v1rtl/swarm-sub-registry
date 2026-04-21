@@ -5,11 +5,11 @@ global:
 scrape_configs:
   # The orion metrics exporter runs on the host (`orion metrics serve
   # --port 9464`). From inside the Prometheus container we reach the
-  # host via host.docker.internal, which is wired by the
-  # `extra_hosts: "host.docker.internal:host-gateway"` entry in
-  # docker-compose.yml on Linux.
+  # host via host.containers.internal (podman's native name; also
+  # aliased as host.docker.internal in compose.yaml for compatibility).
+  # The alias wiring is in compose.yaml's extra_hosts.
   - job_name: orion
     static_configs:
-      - targets: ["host.docker.internal:9464"]
+      - targets: ["host.containers.internal:9464"]
         labels:
           profile: swarm
