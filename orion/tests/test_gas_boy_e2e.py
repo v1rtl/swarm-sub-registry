@@ -511,7 +511,9 @@ def test_10_volume_setup(contracts, volumed, batch_id, participant):
 
 def test_20_cron_no_op_when_not_due(w3, wrangler_dev, contracts, batch_id, participant):
     addr = Web3.to_checksum_address(participant["address"])
-    before_block = w3.eth.block_number
+    # +1 so we only match events from NEW blocks mined during this test,
+    # not whatever was at the latest block when we took the snapshot.
+    before_block = w3.eth.block_number + 1
     bzz_before = contracts["bzz"].functions.balanceOf(addr).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
 
@@ -539,22 +541,18 @@ def test_30_cron_tops_up_when_due(w3, wrangler_dev, contracts, batch_id, partici
 
     price = stamp.functions.lastPrice().call()
     depth = stamp.functions.batches(batch_id).call()[1]
-    norm_bal_before = stamp.functions.batches(batch_id).call()[4]
-    cto_before = stamp.functions.currentTotalOutPayment().call()
-    remaining_before = norm_bal_before - cto_before
     target = price * GRACE_BLOCKS
-    # New precise idempotent semantic: perChunk = target - remaining_before
-    expected_per_chunk = target - remaining_before
-    expected_total = expected_per_chunk << depth
 
     bzz_before = bzz.functions.balanceOf(addr).call()
     stamp_bzz_before = bzz.functions.balanceOf(stamp.address).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
     before_block = w3.eth.block_number
 
-    est_per_chunk, est_total = registry.functions.estimatedTopUp(batch_id).call()
-    assert est_per_chunk == expected_per_chunk
-    assert est_total == expected_total
+    # estimatedTopUp and KeptAlive's exact `perChunk` depend on the block
+    # at which the tx is mined (cto advances by `price` each block), not
+    # the block at which we took the Python-side snapshot. The robust
+    # invariant to assert is the post-condition: remaining == target
+    # after the top-up (which is the whole point of precise targeting).
 
     result = _cron()
     print(f"[due] result = {result}")
@@ -570,12 +568,16 @@ def test_30_cron_tops_up_when_due(w3, wrangler_dev, contracts, batch_id, partici
     assert args["caller"] == GAS_BOY_ADDR
     assert args["batchId"] == batch_id
     assert args["payer"] == addr
-    assert args["perChunk"] == expected_per_chunk
-    assert args["totalAmount"] == expected_total
+    actual_per_chunk = args["perChunk"]
+    actual_total = args["totalAmount"]
+    assert actual_total == actual_per_chunk << depth
+    assert 0 < actual_per_chunk <= target
 
-    assert bzz.functions.balanceOf(addr).call() == bzz_before - expected_total
-    assert bzz.functions.balanceOf(stamp.address).call() == stamp_bzz_before + expected_total
-    # Post-topup remaining should equal exactly target (precise idempotent)
+    # Payer paid exactly the emitted totalAmount
+    assert bzz.functions.balanceOf(addr).call() == bzz_before - actual_total
+    assert bzz.functions.balanceOf(stamp.address).call() == stamp_bzz_before + actual_total
+
+    # Post-topup invariant: remaining landed exactly on target.
     norm_bal_after = stamp.functions.batches(batch_id).call()[4]
     cto_after = stamp.functions.currentTotalOutPayment().call()
     assert norm_bal_after - cto_after == target
@@ -589,7 +591,9 @@ def test_40_idempotent_second_cron_strict_noop(w3, wrangler_dev, contracts, batc
 
     bzz_before = bzz.functions.balanceOf(addr).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
-    before_block = w3.eth.block_number
+    # +1 so test_30's KeptAlive (at the latest block before this test
+    # started) isn't falsely matched by `get_logs(from_block=...)`.
+    before_block = w3.eth.block_number + 1
 
     result = _cron()
     print(f"[idempotent] result = {result}")
@@ -612,12 +616,7 @@ def test_50_next_cycle_tops_up_again(w3, wrangler_dev, contracts, batch_id, part
 
     price = stamp.functions.lastPrice().call()
     depth = stamp.functions.batches(batch_id).call()[1]
-    norm_bal_before = stamp.functions.batches(batch_id).call()[4]
-    cto_before = stamp.functions.currentTotalOutPayment().call()
-    remaining_before = norm_bal_before - cto_before
     target = price * GRACE_BLOCKS
-    expected_per_chunk = target - remaining_before
-    expected_total = expected_per_chunk << depth
     bzz_before = bzz.functions.balanceOf(addr).call()
     before_block = w3.eth.block_number
 
@@ -627,12 +626,14 @@ def test_50_next_cycle_tops_up_again(w3, wrangler_dev, contracts, batch_id, part
     assert result["ok"] is True and result["dueCount"] == 1
     events = _kept_alive_events(registry, before_block)
     assert len(events) == 1
-    assert events[0]["args"]["totalAmount"] == expected_total
 
+    actual_total = events[0]["args"]["totalAmount"]
+    assert actual_total == events[0]["args"]["perChunk"] << depth
+    # Post-topup invariant: remaining landed on target (block-timing-independent).
     norm_bal_after = stamp.functions.batches(batch_id).call()[4]
     cto_after = stamp.functions.currentTotalOutPayment().call()
     assert norm_bal_after - cto_after == target
-    assert bzz.functions.balanceOf(addr).call() == bzz_before - expected_total
+    assert bzz.functions.balanceOf(addr).call() == bzz_before - actual_total
     assert not registry.functions.isDue(batch_id).call()
 
 

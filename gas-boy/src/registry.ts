@@ -36,14 +36,26 @@ export interface RunResult {
   durationMs: number;
 }
 
+// Canonical Multicall3 address (same on every EVM chain it has been
+// published on). viem's `sepolia` chain ships with this configured; its
+// `foundry` chain does NOT (as of viem 2.48), so we inject it ourselves
+// for the local-dev path. orion's Chain.up() pre-deploys the bytecode
+// at this address via anvil_setCode, matching this config.
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
+
 function buildChain(env: Env): Chain {
   const id = Number(env.CHAIN_ID);
   const base =
     id === 11155111 ? sepolia : id === 31337 ? foundry : null;
   if (!base) throw new Error(`unsupported CHAIN_ID: ${env.CHAIN_ID}`);
-  // Override the rpc transport with the env-configured URL while keeping
-  // viem's curated chain metadata (multicall3, native currency, etc.).
-  return { ...base, rpcUrls: { default: { http: [env.RPC_URL] } } };
+  return {
+    ...base,
+    rpcUrls: { default: { http: [env.RPC_URL] } },
+    contracts: {
+      ...base.contracts,
+      multicall3: { address: MULTICALL3_ADDRESS },
+    },
+  };
 }
 
 function buildClients(env: Env): {
