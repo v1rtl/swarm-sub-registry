@@ -302,6 +302,249 @@ contract SubscriptionRegistryTest is Test {
     }
 
     // ------------------------------------------------------------------
+    // keepaliveOne (singular variant)
+    // ------------------------------------------------------------------
+
+    function test_KeepaliveOne_TopsUpDueBatch() public {
+        vm.prank(payer2);
+        reg.subscribe(B, EXT);
+
+        uint256 threshold = uint256(PRICE) * EXT;
+        uint256 total = threshold << 21;
+        uint256 payerBefore = bzz.balanceOf(payer2);
+
+        vm.expectEmit(true, true, true, true);
+        emit SubscriptionRegistry.KeptAlive(anyone, B, payer2, threshold, total);
+        vm.prank(anyone);
+        bool toppedUp = reg.keepaliveOne(B);
+
+        assertTrue(toppedUp);
+        assertEq(bzz.balanceOf(payer2), payerBefore - total);
+    }
+
+    function test_KeepaliveOne_ReturnsFalseWhenNotDue() public {
+        vm.prank(payer);
+        reg.subscribe(A, EXT); // not due
+
+        uint256 before = bzz.balanceOf(payer);
+        vm.recordLogs();
+        vm.prank(anyone);
+        bool toppedUp = reg.keepaliveOne(A);
+
+        assertFalse(toppedUp);
+        assertEq(bzz.balanceOf(payer), before);
+        // No KeptAlive event
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            assertTrue(
+                logs[i].topics[0] != keccak256("KeptAlive(address,bytes32,address,uint256,uint256)"),
+                "unexpected KeptAlive emitted"
+            );
+        }
+    }
+
+    function test_KeepaliveOne_BubblesRevertOnPullFailure() public {
+        vm.prank(payer2);
+        reg.subscribe(B, EXT);
+        // Revoke allowance — transferFrom inside _keepaliveOne will revert.
+        // Whether the revert is the registry's `TransferFromFailed` or the
+        // ERC20's own string depends on the token; either way, keepaliveOne
+        // must propagate the revert (proving it does NOT silently swallow
+        // failures the way bulk keepalive() does via try/catch).
+        vm.prank(payer2);
+        bzz.approve(address(reg), 0);
+
+        vm.prank(anyone);
+        vm.expectRevert();
+        reg.keepaliveOne(B);
+    }
+
+    function test_KeepaliveOne_ReturnsFalseForUnknownBatch() public {
+        // Not subscribed → _keepaliveOne returns (false, ...) without revert
+        vm.prank(anyone);
+        bool toppedUp = reg.keepaliveOne(bytes32(uint256(0xDEAD)));
+        assertFalse(toppedUp);
+    }
+
+    // ------------------------------------------------------------------
+    // pruneOne / pruneDead / isDead
+    // ------------------------------------------------------------------
+
+    function test_PruneOne_RemovesNeverExistedBatch() public {
+        bytes32 ghost = bytes32(uint256(0xDEAD));
+        // Subscribe to a batch that does not exist on PostageStamp
+        vm.prank(payer);
+        reg.subscribe(ghost, EXT);
+        assertTrue(reg.isDead(ghost));
+
+        vm.expectEmit(true, true, true, false);
+        emit SubscriptionRegistry.Pruned(ghost, payer, anyone);
+        vm.prank(anyone);
+        reg.pruneOne(ghost);
+
+        assertEq(reg.subscriptionCount(), 0);
+        (address p,) = reg.subs(ghost);
+        assertEq(p, address(0));
+    }
+
+    function test_PruneOne_RemovesReapedBatch() public {
+        vm.prank(payer);
+        reg.subscribe(A, EXT);
+        // Simulate reaping (PostageStamp.expireLimited removed it)
+        stamp.deleteBatch(A);
+        assertTrue(reg.isDead(A));
+
+        vm.prank(anyone);
+        reg.pruneOne(A);
+        assertEq(reg.subscriptionCount(), 0);
+    }
+
+    function test_PruneOne_RevertsOnAliveBatch() public {
+        vm.prank(payer);
+        reg.subscribe(A, EXT);
+        assertFalse(reg.isDead(A));
+
+        vm.prank(anyone);
+        vm.expectRevert(SubscriptionRegistry.NotDead.selector);
+        reg.pruneOne(A);
+    }
+
+    function test_PruneOne_RevertsOnNotSubscribed() public {
+        vm.prank(anyone);
+        vm.expectRevert(SubscriptionRegistry.NotSubscribed.selector);
+        reg.pruneOne(bytes32(uint256(0xC0FFEE)));
+    }
+
+    function test_PruneOne_OnlySelfGuardOnInternal() public {
+        vm.expectRevert(SubscriptionRegistry.OnlySelf.selector);
+        reg._pruneOne(A);
+    }
+
+    function test_PruneDead_ProcessesMixedArray() public {
+        // Sub A (alive), sub B (dead via reap), sub C (never existed = dead),
+        // plus an id D that has no subscription.
+        bytes32 C = bytes32(uint256(0xCCCC));
+        bytes32 D = bytes32(uint256(0xDDDD));
+
+        vm.prank(payer);
+        reg.subscribe(A, EXT);
+        vm.prank(payer2);
+        reg.subscribe(B, EXT);
+        vm.prank(payer);
+        reg.subscribe(C, EXT);
+        stamp.deleteBatch(B); // reap B
+
+        bytes32[] memory ids = new bytes32[](4);
+        ids[0] = A; ids[1] = B; ids[2] = C; ids[3] = D;
+
+        vm.recordLogs();
+        vm.prank(anyone);
+        reg.pruneDead(ids);
+
+        // Expect 2 Pruned (B, C) and 2 PruneSkipped (A=NotDead, D=NotSubscribed)
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 prunedCount;
+        uint256 skippedCount;
+        bytes4 notDeadSel = SubscriptionRegistry.NotDead.selector;
+        bytes4 notSubSel = SubscriptionRegistry.NotSubscribed.selector;
+        bool sawNotDead;
+        bool sawNotSub;
+        for (uint256 i = 0; i < logs.length; ++i) {
+            bytes32 t0 = logs[i].topics[0];
+            if (t0 == keccak256("Pruned(bytes32,address,address)")) {
+                prunedCount++;
+            } else if (t0 == keccak256("PruneSkipped(bytes32,bytes)")) {
+                skippedCount++;
+                bytes memory reason = abi.decode(logs[i].data, (bytes));
+                bytes4 sel;
+                assembly { sel := mload(add(reason, 32)) }
+                if (sel == notDeadSel) sawNotDead = true;
+                if (sel == notSubSel) sawNotSub = true;
+            }
+        }
+        assertEq(prunedCount, 2, "pruned count");
+        assertEq(skippedCount, 2, "skipped count");
+        assertTrue(sawNotDead, "NotDead selector in skipped reason");
+        assertTrue(sawNotSub, "NotSubscribed selector in skipped reason");
+        // A still subscribed; B and C gone
+        assertEq(reg.subscriptionCount(), 1);
+        (address pa,) = reg.subs(A); assertEq(pa, payer);
+        (address pb,) = reg.subs(B); assertEq(pb, address(0));
+        (address pc,) = reg.subs(C); assertEq(pc, address(0));
+    }
+
+    function test_PruneDead_SwapPopPreservesIntegrity() public {
+        // Subscribe 5 batches. Then prune the middle one. Verify remaining
+        // 4 ids are addressable via batchIds[i] and keepaliveOne still works
+        // (proves _indexPlusOne consistency).
+        bytes32[5] memory ids;
+        for (uint256 i = 0; i < 5; ++i) {
+            ids[i] = bytes32(uint256(0x100 + i));
+            // Even indices: due batches; Odd: not due
+            uint256 normBal = (i % 2 == 0) ? (uint256(PRICE) * EXT - 1) : (uint256(PRICE) * EXT * 2);
+            stamp.createBatch(ids[i], address(uint160(0x1000 + i)), 21, normBal);
+            vm.prank(payer);
+            reg.subscribe(ids[i], EXT);
+        }
+        assertEq(reg.subscriptionCount(), 5);
+
+        // Reap the middle one (index 2) and prune it
+        stamp.deleteBatch(ids[2]);
+        bytes32[] memory toPrune = new bytes32[](1);
+        toPrune[0] = ids[2];
+        vm.prank(anyone);
+        reg.pruneDead(toPrune);
+
+        assertEq(reg.subscriptionCount(), 4);
+
+        // Walk all remaining indices, collect batchIds; assert no duplicates,
+        // none equal to ids[2], and every read works (no out-of-bounds revert)
+        bytes32[] memory remaining = new bytes32[](4);
+        for (uint256 i = 0; i < 4; ++i) {
+            remaining[i] = reg.batchIds(i);
+            assertTrue(remaining[i] != ids[2], "pruned id reappeared");
+        }
+
+        // Each remaining id can still be keepalive'd correctly
+        for (uint256 i = 0; i < 4; ++i) {
+            vm.prank(anyone);
+            reg.keepaliveOne(remaining[i]); // does not revert
+        }
+    }
+
+    function test_PruneDead_Permissionless() public {
+        bytes32 ghost = bytes32(uint256(0xDEAD));
+        vm.prank(payer);
+        reg.subscribe(ghost, EXT);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = ghost;
+
+        // Random EOA, not the payer, not any contract owner — succeeds
+        address rando = makeAddr("rando");
+        vm.prank(rando);
+        reg.pruneDead(ids);
+        assertEq(reg.subscriptionCount(), 0);
+    }
+
+    function test_IsDead_TruthTable() public {
+        // Case 1: not subscribed
+        assertFalse(reg.isDead(bytes32(uint256(0x1))));
+        // Case 2: subscribed and alive
+        vm.prank(payer);
+        reg.subscribe(A, EXT);
+        assertFalse(reg.isDead(A));
+        // Case 3: subscribed and reaped
+        stamp.deleteBatch(A);
+        assertTrue(reg.isDead(A));
+        // Case 4: subscribed but only expired (still has owner) → NOT dead
+        vm.prank(payer2);
+        reg.subscribe(B, EXT);
+        stamp.setCurrentTotalOutPayment(uint256(PRICE) * EXT * 100); // way past expiry
+        assertFalse(reg.isDead(B)); // B still has owner in mock
+    }
+
+    // ------------------------------------------------------------------
     // Fuzz
     // ------------------------------------------------------------------
 

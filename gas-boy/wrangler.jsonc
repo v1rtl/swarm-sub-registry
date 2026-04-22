@@ -22,7 +22,7 @@
       "vars": {
         "RPC_URL": "https://ethereum-sepolia-rpc.publicnode.com",
         "CHAIN_ID": "11155111",
-        "REGISTRY_ADDRESS": "0x700c91Ca6A3CA787f3269A369a336bf69a73b5C7"
+        "REGISTRY_ADDRESS": "0x993f923De49DA0C83e7434A1b35988D1cF79fF21"
       },
       "triggers": {
         "crons": ["*/5 * * * *"]

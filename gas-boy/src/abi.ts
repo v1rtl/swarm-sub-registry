@@ -47,4 +47,49 @@ export const registryAbi = [
       { indexed: false, name: "reason", type: "bytes" },
     ],
   },
+  {
+    type: "function",
+    name: "keepaliveOne",
+    stateMutability: "nonpayable",
+    inputs: [{ type: "bytes32", name: "id" }],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "pruneOne",
+    stateMutability: "nonpayable",
+    inputs: [{ type: "bytes32", name: "id" }],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "pruneDead",
+    stateMutability: "nonpayable",
+    inputs: [{ type: "bytes32[]", name: "ids" }],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "isDead",
+    stateMutability: "view",
+    inputs: [{ type: "bytes32", name: "id" }],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    type: "event",
+    name: "Pruned",
+    inputs: [
+      { indexed: true, name: "batchId", type: "bytes32" },
+      { indexed: true, name: "payer", type: "address" },
+      { indexed: true, name: "caller", type: "address" },
+    ],
+  },
+  {
+    type: "event",
+    name: "PruneSkipped",
+    inputs: [
+      { indexed: true, name: "batchId", type: "bytes32" },
+      { indexed: false, name: "reason", type: "bytes" },
+    ],
+  },
 ] as const;

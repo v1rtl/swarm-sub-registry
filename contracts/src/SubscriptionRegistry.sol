@@ -50,6 +50,8 @@ contract SubscriptionRegistry {
         uint256 totalAmount
     );
     event KeepaliveSkipped(bytes32 indexed batchId, bytes reason);
+    event Pruned(bytes32 indexed batchId, address indexed payer, address indexed caller);
+    event PruneSkipped(bytes32 indexed batchId, bytes reason);
 
     error AlreadySubscribed();
     error NotSubscribed();
@@ -58,6 +60,7 @@ contract SubscriptionRegistry {
     error Reentrancy();
     error TransferFromFailed();
     error OnlySelf();
+    error NotDead();
 
     modifier nonReentrant() {
         if (_locked != 1) revert Reentrancy();
@@ -174,6 +177,68 @@ contract SubscriptionRegistry {
         return (true, s.payer, threshold, t);
     }
 
+    /// @notice Keep alive a single subscription. Reverts bubble through to
+    /// the caller (unlike the bulk `keepalive()` which catches per-batch
+    /// failures via try/catch). Suitable for targeted callers that want to
+    /// know exactly why their call failed.
+    function keepaliveOne(bytes32 id) external nonReentrant returns (bool toppedUp) {
+        uint64 price = stamp.lastPrice();
+        uint256 cto = stamp.currentTotalOutPayment();
+        address payer;
+        uint256 perChunk;
+        uint256 total;
+        (toppedUp, payer, perChunk, total) = this._keepaliveOne(id, price, cto);
+        if (toppedUp) emit KeptAlive(msg.sender, id, payer, perChunk, total);
+    }
+
+    // ------------------------------------------------------------------
+    // Pruning (permissionless cleanup of dead subscriptions)
+    // ------------------------------------------------------------------
+
+    /// @notice Prune a single dead subscription. Reverts on `NotSubscribed`
+    /// or `NotDead` so the caller can react accordingly.
+    function pruneOne(bytes32 id) external nonReentrant {
+        address payer = this._pruneOne(id);
+        emit Pruned(id, payer, msg.sender);
+    }
+
+    /// @notice Permissionlessly remove subscriptions for batches the
+    /// PostageStamp contract no longer knows about (owner == 0). Per-id
+    /// failures are caught and emitted as `PruneSkipped` so a single bad
+    /// id does not block the whole batch — race-safe across concurrent
+    /// callers.
+    function pruneDead(bytes32[] calldata ids) external nonReentrant {
+        for (uint256 i = 0; i < ids.length; ++i) {
+            try this._pruneOne(ids[i]) returns (address payer) {
+                emit Pruned(ids[i], payer, msg.sender);
+            } catch (bytes memory err) {
+                emit PruneSkipped(ids[i], err);
+            }
+        }
+    }
+
+    /// @dev External only so `try/catch` in `pruneDead()` can isolate
+    /// per-id failures. Restricted to self-calls.
+    function _pruneOne(bytes32 id) external returns (address payer) {
+        if (msg.sender != address(this)) revert OnlySelf();
+        Subscription memory s = subs[id];
+        if (s.payer == address(0)) revert NotSubscribed();
+        (address owner_,,,,,) = stamp.batches(id);
+        if (owner_ != address(0)) revert NotDead();
+        payer = s.payer;
+
+        uint256 idx = _indexPlusOne[id] - 1;
+        uint256 last = batchIds.length - 1;
+        if (idx != last) {
+            bytes32 lastId = batchIds[last];
+            batchIds[idx] = lastId;
+            _indexPlusOne[lastId] = idx + 1;
+        }
+        batchIds.pop();
+        delete _indexPlusOne[id];
+        delete subs[id];
+    }
+
     // ------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------
@@ -193,6 +258,15 @@ contract SubscriptionRegistry {
         uint256 cto = stamp.currentTotalOutPayment();
         if (normBal <= cto) return false;
         return (normBal - cto) < uint256(price) * uint256(s.extensionBlocks);
+    }
+
+    /// @notice True iff this subscription's batch is permanently un-keepable
+    /// because PostageStamp no longer knows about it (never created, or
+    /// reaped after expiry). Eligible for `pruneDead()`.
+    function isDead(bytes32 id) external view returns (bool) {
+        if (subs[id].payer == address(0)) return false;
+        (address owner_,,,,,) = stamp.batches(id);
+        return owner_ == address(0);
     }
 
     /// @notice Estimated per-chunk and total BZZ required for the next top-up.

@@ -31,6 +31,14 @@ _ANVIL_DEPLOYER_KEY = bytes.fromhex(
 _CHAIN_STATE_FILENAME = "chain.json"
 _ANVIL_SPAWN_TIMEOUT_S = 15
 
+# Canonical Multicall3 deployment — same address on every EVM chain it
+# has been published on (deterministic CREATE2). Recent anvil versions
+# pre-deploy it; older versions (and our pinned environment) do not, so
+# we inject the deployed bytecode via `anvil_setCode` after spawn. viem
+# and other libs assume this address is populated.
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+_MULTICALL3_BYTECODE_PATH = Path(__file__).parent / "data" / "multicall3.hex"
+
 
 @dataclass
 class Chain:
@@ -103,6 +111,7 @@ class Chain:
             state_dir=state_dir,
         )
         chain._w3 = w3
+        chain.ensure_multicall3()
         chain._save_state()
 
         if not keep_running:
@@ -222,6 +231,27 @@ class Chain:
     def impersonate(self, address: str) -> "ImpersonationHandle":
         """Context manager that impersonates ``address`` for a ``with`` block."""
         return ImpersonationHandle(self, address)
+
+    def ensure_multicall3(self) -> bool:
+        """Inject the canonical Multicall3 bytecode at the canonical
+        address via ``anvil_setCode`` if it is not already present.
+
+        Returns ``True`` if bytecode was newly injected, ``False`` if it
+        was already there. Idempotent — safe to call from
+        :meth:`Chain.up` (we always inject) and from
+        :meth:`Chain.attach` (skips if the host anvil pre-deployed it,
+        as recent Foundry versions do).
+        """
+        existing = self.w3.eth.get_code(MULTICALL3_ADDRESS)
+        if len(existing) > 0:
+            return False
+        bytecode = _MULTICALL3_BYTECODE_PATH.read_text().strip()
+        if not bytecode.startswith("0x"):
+            bytecode = "0x" + bytecode
+        self.w3.provider.make_request(
+            "anvil_setCode", [MULTICALL3_ADDRESS, bytecode]
+        )
+        return True
 
     # ---- state persistence ------------------------------------------
 

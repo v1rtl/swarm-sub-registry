@@ -24,23 +24,13 @@ export default {
     await task;
   },
 
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, _env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (url.pathname === "/trigger") {
-      const result = await runKeepalive(env);
-      console.log(
-        JSON.stringify({ kind: "gas-boy/trigger", ...result }),
-      );
-      return new Response(JSON.stringify(result, null, 2), {
-        status: result.ok ? 200 : 500,
-        headers: { "content-type": "application/json" },
-      });
-    }
     if (url.pathname === "/health") {
       return new Response("gas-boy ok\n", { status: 200 });
     }
     return new Response(
-      "gas-boy — endpoints: /trigger (run keepalive now), /health\n",
+      "gas-boy — endpoint: /health (keepalive + pruneDead run on cron)\n",
       { status: 200 },
     );
   },
