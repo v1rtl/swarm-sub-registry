@@ -1,4 +1,5 @@
-"""End-to-end integration test for the gas-boy Cloudflare Worker.
+"""End-to-end integration test for the gas-boy Cloudflare Worker
+against the VolumeRegistry contract.
 
 Prerequisites (run these manually before invoking pytest):
 
@@ -15,32 +16,39 @@ leaves the batch already "due" or even expired before gas-boy runs.
 holds initially.
 
 The test uses anvil_setStorageAt to lower PostageStamp.minimumValidityBlocks
-from 17280 → 100, allowing a small EXTENSION_BLOCKS (200) and fast mining.
+from 17280 → 100, allowing a small GRACE_BLOCKS (200) and fast mining.
 
 Then:
 
     uv run pytest tests/test_gas_boy_e2e.py -s
 
-What this exercises:
-  - Deploy + subscribe flow works against a live anvil + PostageStamp.
-  - Worker's /trigger endpoint correctly no-ops when nothing is due.
+What this exercises (against the volume model):
+  - Deploy + createVolume + designate/confirm flow works against a live
+    anvil + PostageStamp.
+  - Worker's scheduled() cron correctly no-ops when nothing is due.
   - When blocks are mined past the due threshold, the Worker calls
     `keepalive()` exactly once, emits `KeptAlive`, and advances the
-    batch's normalisedBalance by `threshold` (= price * extensionBlocks).
-  - Hysteresis: a second /trigger with no block progression is a no-op.
-  - Cycle: mining another extension's worth of blocks makes the batch
+    batch's normalisedBalance by (target - remaining_before).
+  - Idempotency: a second cron fire with no block progression is a
+    strict no-op (bit-exact, not "approximately").
+  - Cycle: mining another grace-period's worth of blocks makes the volume
     due again and the Worker tops it up a second time.
   - A payer that revokes their allowance yields `KeepaliveSkipped` and
-    does NOT crash the Worker (scheduled() still returns 200).
+    does NOT crash the Worker (scheduled() still completes cleanly).
 
-The test spawns `wrangler dev` as a subprocess and drives it over HTTP.
+The test spawns `wrangler dev` as a subprocess and drives it by hitting
+wrangler's built-in scheduled-simulation endpoint
+(`/cdn-cgi/handler/scheduled`). Since scheduled() doesn't return a body,
+results are observed via:
+  (a) on-chain events (KeptAlive, KeepaliveSkipped, Pruned, PruneSkipped)
+  (b) the JSON log lines gas-boy writes to stdout (captured to a log file)
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import signal
-import socket
 import subprocess
 import time
 import urllib.request
@@ -58,34 +66,51 @@ GAS_BOY_DIR = REPO_ROOT / "gas-boy"
 
 WRANGLER_PORT = 8787
 WRANGLER_URL = f"http://127.0.0.1:{WRANGLER_PORT}"
+WRANGLER_CRON_URL = f"{WRANGLER_URL}/cdn-cgi/handler/scheduled"
 
-# Anvil prefunded account #1 — gas-boy's caller (distinct from op-0 payer).
+# Anvil prefunded account #1 — gas-boy's caller (distinct from op-0/op-1 payer).
 GAS_BOY_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 GAS_BOY_ADDR = Account.from_key(GAS_BOY_KEY).address
 
 # We lower PostageStamp.minimumValidityBlocks from 17280 → 100 via
 # anvil_setStorageAt (see `lowered_min_validity` fixture), so
-# EXTENSION_BLOCKS can be small and `anvil_mine` calls finish instantly.
-EXTENSION_BLOCKS = 200
+# GRACE_BLOCKS can be small and `anvil_mine` calls finish instantly.
+GRACE_BLOCKS = 200
 
 # ---------------------------------------------------------------------------
 # ABIs (minimal surfaces)
 # ---------------------------------------------------------------------------
 
 REGISTRY_ABI = [
-    {"type": "function", "name": "subscribe", "stateMutability": "nonpayable",
-     "inputs": [{"type": "bytes32"}, {"type": "uint32"}], "outputs": []},
-    {"type": "function", "name": "updateExtension", "stateMutability": "nonpayable",
-     "inputs": [{"type": "bytes32"}, {"type": "uint32"}], "outputs": []},
-    {"type": "function", "name": "unsubscribe", "stateMutability": "nonpayable",
+    {"type": "function", "name": "designatePayer", "stateMutability": "nonpayable",
+     "inputs": [{"type": "address"}], "outputs": []},
+    {"type": "function", "name": "confirmAccount", "stateMutability": "nonpayable",
+     "inputs": [{"type": "address"}], "outputs": []},
+    {"type": "function", "name": "revokeAccount", "stateMutability": "nonpayable",
+     "inputs": [{"type": "address"}], "outputs": []},
+    {"type": "function", "name": "createVolume", "stateMutability": "nonpayable",
+     "inputs": [{"type": "bytes32"}, {"type": "address"}, {"type": "uint64"}, {"type": "uint32"}],
+     "outputs": []},
+    {"type": "function", "name": "deleteVolume", "stateMutability": "nonpayable",
      "inputs": [{"type": "bytes32"}], "outputs": []},
-    {"type": "function", "name": "subs", "stateMutability": "view",
+    {"type": "function", "name": "modifyVolume", "stateMutability": "nonpayable",
+     "inputs": [{"type": "bytes32"}, {"type": "uint64"}, {"type": "uint32"}], "outputs": []},
+    {"type": "function", "name": "volumes", "stateMutability": "view",
      "inputs": [{"type": "bytes32"}],
+     "outputs": [{"type": "address", "name": "owner"},
+                 {"type": "address", "name": "chunkSigner"},
+                 {"type": "uint64", "name": "ttlExpiry"},
+                 {"type": "uint8", "name": "initialDepth"},
+                 {"type": "uint32", "name": "graceBlocks"}]},
+    {"type": "function", "name": "accounts", "stateMutability": "view",
+     "inputs": [{"type": "address"}],
      "outputs": [{"type": "address", "name": "payer"},
-                 {"type": "uint32", "name": "extensionBlocks"}]},
+                 {"type": "bool", "name": "active"}]},
     {"type": "function", "name": "isDue", "stateMutability": "view",
      "inputs": [{"type": "bytes32"}], "outputs": [{"type": "bool"}]},
-    {"type": "function", "name": "subscriptionCount", "stateMutability": "view",
+    {"type": "function", "name": "isDead", "stateMutability": "view",
+     "inputs": [{"type": "bytes32"}], "outputs": [{"type": "bool"}]},
+    {"type": "function", "name": "volumeCount", "stateMutability": "view",
      "inputs": [], "outputs": [{"type": "uint256"}]},
     {"type": "function", "name": "estimatedTopUp", "stateMutability": "view",
      "inputs": [{"type": "bytes32"}],
@@ -96,17 +121,20 @@ REGISTRY_ABI = [
          {"indexed": True, "name": "caller", "type": "address"},
          {"indexed": True, "name": "batchId", "type": "bytes32"},
          {"indexed": True, "name": "payer", "type": "address"},
-         {"indexed": False, "name": "topUpPerChunk", "type": "uint256"},
+         {"indexed": False, "name": "perChunk", "type": "uint256"},
          {"indexed": False, "name": "totalAmount", "type": "uint256"}]},
     {"type": "event", "name": "KeepaliveSkipped", "anonymous": False,
      "inputs": [
          {"indexed": True, "name": "batchId", "type": "bytes32"},
          {"indexed": False, "name": "reason", "type": "bytes"}]},
-    {"type": "event", "name": "Subscribed", "anonymous": False,
+    {"type": "event", "name": "VolumeCreated", "anonymous": False,
      "inputs": [
          {"indexed": True, "name": "batchId", "type": "bytes32"},
-         {"indexed": True, "name": "payer", "type": "address"},
-         {"indexed": False, "name": "extensionBlocks", "type": "uint32"}]},
+         {"indexed": True, "name": "owner", "type": "address"},
+         {"indexed": True, "name": "chunkSigner", "type": "address"},
+         {"indexed": False, "name": "ttlExpiry", "type": "uint64"},
+         {"indexed": False, "name": "initialDepth", "type": "uint8"},
+         {"indexed": False, "name": "graceBlocks", "type": "uint32"}]},
 ]
 
 ERC20_ABI = [
@@ -164,8 +192,6 @@ def participants_state() -> dict[str, Any]:
 
 @pytest.fixture(scope="module")
 def w3(chain_state: dict[str, Any]) -> Web3:
-    # Fail fast on stale state/chain.json rather than hanging on a dead anvil.
-    # See ISSUES.md "Stale anvil / wrong chain".
     pid = chain_state.get("pid")
     if pid:
         try:
@@ -173,30 +199,20 @@ def w3(chain_state: dict[str, Any]) -> Web3:
         except ProcessLookupError:
             pytest.fail(
                 f"anvil pid {pid} from state/chain.json is dead — "
-                f"state is stale, re-run `uv run orion up --profile swarm` "
-                f"and the other prerequisites (see test docstring)"
+                f"state is stale, re-run `uv run orion up --profile swarm`"
             )
-    # Large anvil_mine calls can take several seconds; default 10s is tight.
     w = Web3(Web3.HTTPProvider(chain_state["rpc"], request_kwargs={"timeout": 120}))
     if not w.is_connected():
-        pytest.fail(
-            f"anvil not reachable at {chain_state['rpc']} "
-            f"(pid={pid}) — state/chain.json may be stale"
-        )
-    actual_chain_id = w.eth.chain_id
-    expected_chain_id = chain_state["chain_id"]
-    if actual_chain_id != expected_chain_id:
-        pytest.fail(
-            f"chain_id mismatch: rpc reports {actual_chain_id}, "
-            f"state/chain.json says {expected_chain_id} — wrong anvil?"
-        )
+        pytest.fail(f"anvil not reachable at {chain_state['rpc']} (pid={pid})")
+    if w.eth.chain_id != chain_state["chain_id"]:
+        pytest.fail("chain_id mismatch — wrong anvil?")
     return w
 
 
 PAYER_LABEL = "op-1"
 
 @pytest.fixture(scope="module")
-def payer(participants_state: dict[str, Any]) -> dict[str, Any]:
+def participant(participants_state: dict[str, Any]) -> dict[str, Any]:
     p = participants_state["participants"].get(PAYER_LABEL)
     assert p is not None, f"{PAYER_LABEL} not provisioned — see test docstring"
     assert p["batches"], f"{PAYER_LABEL} has no batch"
@@ -204,13 +220,13 @@ def payer(participants_state: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.fixture(scope="module")
-def batch_id(payer: dict[str, Any]) -> bytes:
-    return bytes.fromhex(payer["batches"][0]["batch_id"][2:])
+def batch_id(participant: dict[str, Any]) -> bytes:
+    return bytes.fromhex(participant["batches"][0]["batch_id"][2:])
 
 
 @pytest.fixture(scope="module")
 def contracts(w3: Web3, deployment_state: dict[str, Any], registry_state: dict[str, Any]):
-    addr = lambda a: Web3.to_checksum_address(a)
+    addr = Web3.to_checksum_address
     return {
         "registry": w3.eth.contract(address=addr(registry_state["address"]), abi=REGISTRY_ABI),
         "bzz": w3.eth.contract(address=addr(deployment_state["contracts"]["Token"]), abi=ERC20_ABI),
@@ -241,34 +257,25 @@ def _tx_defaults(w3: Web3, sender: str) -> dict[str, Any]:
 
 
 def _anvil_mine(w3: Web3, n: int) -> None:
-    # anvil supports an optional count parameter on evm_mine (hex string).
     w3.provider.make_request("anvil_mine", [hex(n)])
 
 
 def _fast_forward_to_near_due(w3: Web3, stamp, batch_id: bytes,
-                              extension_blocks: int, margin: int = 10) -> None:
-    """If the gap between remaining balance and threshold is large, poke
-    PostageStamp.totalOutPayment (slot 5) so only `margin` blocks of real
-    mining are needed.  This avoids mining tens of thousands of empty blocks.
-    """
+                              grace_blocks: int, margin: int = 10) -> None:
+    """Bump PostageStamp.totalOutPayment (slot 5) so only `margin` blocks
+    of real mining are needed to push the volume into the due state."""
     price = stamp.functions.lastPrice().call()
     if price == 0:
         return
     norm_bal = stamp.functions.batches(batch_id).call()[4]
     cto = stamp.functions.currentTotalOutPayment().call()
     remaining = norm_bal - cto
-    threshold = price * extension_blocks
-    gap = remaining - threshold
+    target = price * grace_blocks
+    gap = remaining - target
     if gap <= price * margin:
         return  # already close enough
-    # We want: normBal - newCto = threshold + margin * price
-    # newCto = normBal - threshold - margin * price
-    # cto = totalOutPayment + (block.number - lastUpdatedBlock) * price
-    # So new totalOutPayment = newCto - (block.number - lastUpdatedBlock) * price
-    # Easier: read current totalOutPayment, add the delta.
     current_top = int.from_bytes(
         w3.eth.get_storage_at(stamp.address, _SLOT_TOTAL_OUT_PAYMENT), "big")
-    # We want to increase cto by (gap - margin * price).
     bump = gap - margin * price
     new_top = current_top + bump
     w3.provider.make_request("anvil_setStorageAt", [
@@ -279,37 +286,29 @@ def _fast_forward_to_near_due(w3: Web3, stamp, batch_id: bytes,
 
 
 def _mine_until_due(w3: Web3, registry, stamp, batch_id: bytes,
-                    extension_blocks: int) -> int:
-    """Make `batch_id` due by fast-forwarding totalOutPayment then mining
-    the last few blocks.  Returns the number of blocks actually mined.
-    """
+                    grace_blocks: int) -> int:
     if registry.functions.isDue(batch_id).call():
         return 0
     price = stamp.functions.lastPrice().call()
-    assert price > 0, "lastPrice is 0 — run `uv run orion prime set-postage-price --price 44445`"
+    assert price > 0, "lastPrice is 0 — run `uv run orion prime set-postage-price ...`"
 
-    # Fast-forward so only ~10 blocks of real mining remain.
-    _fast_forward_to_near_due(w3, stamp, batch_id, extension_blocks)
+    _fast_forward_to_near_due(w3, stamp, batch_id, grace_blocks)
 
     norm_bal = stamp.functions.batches(batch_id).call()[4]
     cto = stamp.functions.currentTotalOutPayment().call()
     remaining = norm_bal - cto
-    threshold = price * extension_blocks
-    gap = remaining - threshold
+    target = price * grace_blocks
+    gap = remaining - target
     if gap < 0:
         return 0
     blocks = (gap // price) + 1
     _anvil_mine(w3, int(blocks))
     assert registry.functions.isDue(batch_id).call(), (
-        f"still not due after mining {blocks} (price={price} ext={extension_blocks} "
-        f"remaining={remaining} threshold={threshold})"
+        f"still not due after mining {blocks} (price={price} grace={grace_blocks} "
+        f"remaining={remaining} target={target})"
     )
     return int(blocks)
 
-
-# ---------------------------------------------------------------------------
-# Anvil storage pokes — speed up mining by lowering minimumValidityBlocks
-# ---------------------------------------------------------------------------
 
 # PostageStamp storage layout (from compiled artifact):
 #   slot 5: totalOutPayment (uint256)
@@ -320,20 +319,12 @@ _SLOT_PRICE_PACKED = 9
 _MIN_VALIDITY_BLOCKS = 100
 
 
-def _poke_slot9(w3: Web3, stamp_addr: str, *,
-                last_price: int | None = None,
-                min_validity: int | None = None,
-                last_updated: int | None = None) -> None:
-    """Read-modify-write the packed slot 9 of PostageStamp."""
+def _poke_slot9(w3: Web3, stamp_addr: str, *, min_validity: int | None = None) -> None:
     raw = w3.eth.get_storage_at(Web3.to_checksum_address(stamp_addr), _SLOT_PRICE_PACKED)
     val = int.from_bytes(raw, "big")
     mask64 = (1 << 64) - 1
-    if last_price is not None:
-        val = (val & ~mask64) | last_price
     if min_validity is not None:
         val = (val & ~(mask64 << 64)) | (min_validity << 64)
-    if last_updated is not None:
-        val = (val & ~(mask64 << 128)) | (last_updated << 128)
     w3.provider.make_request("anvil_setStorageAt", [
         Web3.to_checksum_address(stamp_addr),
         hex(_SLOT_PRICE_PACKED),
@@ -343,53 +334,57 @@ def _poke_slot9(w3: Web3, stamp_addr: str, *,
 
 @pytest.fixture(scope="module")
 def lowered_min_validity(w3: Web3, contracts):
-    """Lower PostageStamp.minimumValidityBlocks so EXTENSION_BLOCKS can be small."""
     _poke_slot9(w3, contracts["stamp"].address, min_validity=_MIN_VALIDITY_BLOCKS)
     return True
 
 
 # ---------------------------------------------------------------------------
-# Subscribe op-0 payer to the registry (module-scoped, runs once).
+# Volume fixture: owner is the participant (payer and owner fold into one
+# identity here since the participant already holds BZZ and has a postage
+# batch registered with their key as chunkSigner on PostageStamp).
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def subscribed(w3: Web3, contracts, payer, batch_id, registry_state, lowered_min_validity):
-    print("\n[subscribed] starting")
-    payer_key = "0x" + payer["signing_key"]
-    payer_addr = Web3.to_checksum_address(payer["address"])
+def volumed(w3: Web3, contracts, participant, batch_id, registry_state, lowered_min_validity):
+    """Set up a complete volume: designate+confirm account (self-pay) and
+    create the volume entry. Idempotent across test re-runs."""
+    print("\n[volumed] starting")
+    key = "0x" + participant["signing_key"]
+    addr = Web3.to_checksum_address(participant["address"])
     registry_addr = Web3.to_checksum_address(registry_state["address"])
 
-    # Approve BZZ (max) from payer → registry, if not already.
-    cur = contracts["bzz"].functions.allowance(payer_addr, registry_addr).call()
-    print(f"[subscribed] allowance={cur}")
+    # Approve BZZ to registry (max) if not already
+    cur = contracts["bzz"].functions.allowance(addr, registry_addr).call()
     if cur < 2**255:
-        tx = contracts["bzz"].functions.approve(registry_addr, 2**256 - 1).build_transaction(
-            _tx_defaults(w3, payer_addr))
-        _send(w3, payer_key, tx)
-        print("[subscribed] approved")
+        _send(w3, key, contracts["bzz"].functions.approve(
+            registry_addr, 2**256 - 1
+        ).build_transaction(_tx_defaults(w3, addr)))
+        print("[volumed] approved BZZ")
 
-    # Subscribe if not already — or update ext if already there with a stale value.
-    existing = contracts["registry"].functions.subs(batch_id).call()
-    print(f"[subscribed] existing sub: {existing}")
-    if existing[0] == "0x0000000000000000000000000000000000000000":
-        tx = contracts["registry"].functions.subscribe(batch_id, EXTENSION_BLOCKS).build_transaction(
-            _tx_defaults(w3, payer_addr))
-        _send(w3, payer_key, tx)
-        print("[subscribed] subscribed")
-    elif existing[1] != EXTENSION_BLOCKS:
-        tx = contracts["registry"].functions.updateExtension(batch_id, EXTENSION_BLOCKS).build_transaction(
-            _tx_defaults(w3, payer_addr))
-        _send(w3, payer_key, tx)
-        print("[subscribed] ext updated")
+    # Self-pay handshake: designate self, then confirm self
+    acct_payer, acct_active = contracts["registry"].functions.accounts(addr).call()
+    if not (acct_active and acct_payer == addr):
+        _send(w3, key, contracts["registry"].functions.designatePayer(addr).build_transaction(
+            _tx_defaults(w3, addr)))
+        _send(w3, key, contracts["registry"].functions.confirmAccount(addr).build_transaction(
+            _tx_defaults(w3, addr)))
+        print("[volumed] handshake completed")
 
-    assert contracts["registry"].functions.subscriptionCount().call() == 1
-    assert contracts["registry"].functions.subs(batch_id).call()[1] == EXTENSION_BLOCKS
-    print("[subscribed] done")
+    # Create volume if not present (owner = chunkSigner = participant)
+    existing_owner, *_ = contracts["registry"].functions.volumes(batch_id).call()
+    if existing_owner == "0x0000000000000000000000000000000000000000":
+        _send(w3, key, contracts["registry"].functions.createVolume(
+            batch_id, addr, 0, GRACE_BLOCKS
+        ).build_transaction(_tx_defaults(w3, addr)))
+        print("[volumed] volume created")
+
+    assert contracts["registry"].functions.volumeCount().call() == 1
+    print("[volumed] done")
     return True
 
 
 # ---------------------------------------------------------------------------
-# Wrangler dev subprocess
+# Wrangler dev subprocess + cron simulation helper
 # ---------------------------------------------------------------------------
 
 WRANGLER_LOG = GAS_BOY_DIR / ".wrangler-dev.log"
@@ -407,9 +402,7 @@ def _wait_for_health(port: int, log_path: Path, proc: subprocess.Popen,
                 f"--- log ---\n{tail}"
             )
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/health", timeout=2
-            ) as r:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
                 r.read()
                 return
         except Exception as e:
@@ -423,14 +416,9 @@ def _wait_for_health(port: int, log_path: Path, proc: subprocess.Popen,
 
 
 @pytest.fixture(scope="module")
-def wrangler_dev(registry_state, subscribed) -> Iterator[None]:
-    # Write .dev.vars with the gas-boy caller's key.
+def wrangler_dev(registry_state, volumed) -> Iterator[None]:
     (GAS_BOY_DIR / ".dev.vars").write_text(f'PRIVATE_KEY="{GAS_BOY_KEY}"\n')
-
-    # Route stdout/stderr to a log file so the subprocess never blocks on
-    # a full pipe buffer (which was hanging the test).
     log_file = WRANGLER_LOG.open("w")
-
     cmd = [
         "wrangler", "dev",
         "--port", str(WRANGLER_PORT),
@@ -441,10 +429,8 @@ def wrangler_dev(registry_state, subscribed) -> Iterator[None]:
     ]
     print(f"\n[wrangler] launching: {' '.join(cmd)}  (log: {WRANGLER_LOG})")
     proc = subprocess.Popen(
-        cmd,
-        cwd=GAS_BOY_DIR,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
+        cmd, cwd=GAS_BOY_DIR,
+        stdout=log_file, stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     try:
@@ -468,18 +454,40 @@ def wrangler_dev(registry_state, subscribed) -> Iterator[None]:
                 print("\n".join(tail_lines))
 
 
-def _trigger() -> dict[str, Any]:
-    with urllib.request.urlopen(f"{WRANGLER_URL}/trigger", timeout=60) as resp:
-        body = resp.read().decode()
-        assert resp.status in (200, 500), f"unexpected status: {resp.status}"
-        return json.loads(body)
+_LOG_RE = re.compile(r'\{"kind":"gas-boy/scheduled"[^}]*\}')
 
 
-def _kept_alive_events(w3: Web3, registry, from_block: int) -> list[EventData]:
+def _cron() -> dict[str, Any]:
+    """Fire wrangler's scheduled handler and return the parsed RunResult.
+
+    Wrangler's cron simulation endpoint returns no body, so we scrape the
+    latest `gas-boy/scheduled` JSON log line written to WRANGLER_LOG after
+    the request settles.
+    """
+    log_len_before = WRANGLER_LOG.stat().st_size if WRANGLER_LOG.exists() else 0
+    with urllib.request.urlopen(WRANGLER_CRON_URL, timeout=60) as resp:
+        assert resp.status == 200, f"unexpected status: {resp.status}"
+        resp.read()
+
+    # Poll the log file for the new JSON log line
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if WRANGLER_LOG.exists() and WRANGLER_LOG.stat().st_size > log_len_before:
+            with WRANGLER_LOG.open("r") as f:
+                f.seek(log_len_before)
+                new = f.read()
+            matches = _LOG_RE.findall(new)
+            if matches:
+                return json.loads(matches[-1])
+        time.sleep(0.1)
+    raise RuntimeError(f"no gas-boy/scheduled log line observed after cron fire")
+
+
+def _kept_alive_events(registry, from_block: int) -> list[EventData]:
     return registry.events.KeptAlive().get_logs(from_block=from_block)
 
 
-def _skipped_events(w3: Web3, registry, from_block: int) -> list[EventData]:
+def _skipped_events(registry, from_block: int) -> list[EventData]:
     return registry.events.KeepaliveSkipped().get_logs(from_block=from_block)
 
 
@@ -489,183 +497,176 @@ def _skipped_events(w3: Web3, registry, from_block: int) -> list[EventData]:
 
 def test_00_sanity_state_loaded(contracts, registry_state, participants_state):
     assert registry_state["address"].startswith("0x")
-    assert contracts["registry"].functions.subscriptionCount().call() >= 0
+    assert contracts["registry"].functions.volumeCount().call() >= 0
     assert PAYER_LABEL in participants_state["participants"]
 
 
-def test_10_subscribe(w3, contracts, subscribed, batch_id, payer):
-    # Subscription is in place; batch should NOT be due yet (fresh batch,
-    # remaining per-chunk balance is huge relative to the threshold).
-    assert contracts["registry"].functions.subscriptionCount().call() == 1
+def test_10_volume_setup(contracts, volumed, batch_id, participant):
+    addr = Web3.to_checksum_address(participant["address"])
+    assert contracts["registry"].functions.volumeCount().call() == 1
     assert not contracts["registry"].functions.isDue(batch_id).call()
+    (payer, active) = contracts["registry"].functions.accounts(addr).call()
+    assert active and payer == addr
 
 
-def test_20_trigger_no_op_when_not_due(w3, wrangler_dev, contracts, batch_id, payer):
-    registry_addr = contracts["registry"].address
-    payer_addr = Web3.to_checksum_address(payer["address"])
+def test_20_cron_no_op_when_not_due(w3, wrangler_dev, contracts, batch_id, participant):
+    addr = Web3.to_checksum_address(participant["address"])
     before_block = w3.eth.block_number
-    payer_bzz_before = contracts["bzz"].functions.balanceOf(payer_addr).call()
+    bzz_before = contracts["bzz"].functions.balanceOf(addr).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
 
-    result = _trigger()
+    result = _cron()
     print(f"[not-due] result = {result}")
 
     assert result["ok"] is True
     assert result.get("dueCount") == 0
-    assert result.get("skipped") == "no subscriptions due"
-    # No tx should have been sent.
+    assert result.get("deadCount") == 0
+    assert result.get("skipped") == "no subscriptions actionable"
     assert w3.eth.get_transaction_count(GAS_BOY_ADDR) == nonce_before
-    # No balance movement.
-    assert contracts["bzz"].functions.balanceOf(payer_addr).call() == payer_bzz_before
-    # No events since before_block.
-    assert _kept_alive_events(w3, contracts["registry"], before_block) == []
+    assert contracts["bzz"].functions.balanceOf(addr).call() == bzz_before
+    assert _kept_alive_events(contracts["registry"], before_block) == []
 
 
-def test_30_trigger_tops_up_when_due(w3, wrangler_dev, contracts, batch_id, payer):
+def test_30_cron_tops_up_when_due(w3, wrangler_dev, contracts, batch_id, participant):
     registry = contracts["registry"]
     stamp = contracts["stamp"]
     bzz = contracts["bzz"]
-    payer_addr = Web3.to_checksum_address(payer["address"])
+    addr = Web3.to_checksum_address(participant["address"])
 
-    # Drive chain until due.
-    mined = _mine_until_due(w3, registry, stamp, batch_id, EXTENSION_BLOCKS)
-    print(f"[due] mined {mined} blocks to trigger due state")
+    mined = _mine_until_due(w3, registry, stamp, batch_id, GRACE_BLOCKS)
+    print(f"[due] mined {mined} blocks")
     assert registry.functions.isDue(batch_id).call()
 
-    # Snapshot.
     price = stamp.functions.lastPrice().call()
     depth = stamp.functions.batches(batch_id).call()[1]
-    threshold = price * EXTENSION_BLOCKS
-    expected_total = threshold << depth
-
     norm_bal_before = stamp.functions.batches(batch_id).call()[4]
-    payer_bzz_before = bzz.functions.balanceOf(payer_addr).call()
+    cto_before = stamp.functions.currentTotalOutPayment().call()
+    remaining_before = norm_bal_before - cto_before
+    target = price * GRACE_BLOCKS
+    # New precise idempotent semantic: perChunk = target - remaining_before
+    expected_per_chunk = target - remaining_before
+    expected_total = expected_per_chunk << depth
+
+    bzz_before = bzz.functions.balanceOf(addr).call()
     stamp_bzz_before = bzz.functions.balanceOf(stamp.address).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
     before_block = w3.eth.block_number
 
-    # Sanity: estimatedTopUp matches our math.
     est_per_chunk, est_total = registry.functions.estimatedTopUp(batch_id).call()
-    assert est_per_chunk == threshold
+    assert est_per_chunk == expected_per_chunk
     assert est_total == expected_total
 
-    result = _trigger()
+    result = _cron()
     print(f"[due] result = {result}")
 
     assert result["ok"] is True, result
     assert result["dueCount"] == 1
     assert result["txHash"].startswith("0x")
-
-    # Exactly one tx from gas-boy.
     assert w3.eth.get_transaction_count(GAS_BOY_ADDR) == nonce_before + 1
 
-    # KeptAlive event with exact values.
-    events = _kept_alive_events(w3, registry, before_block)
+    events = _kept_alive_events(registry, before_block)
     assert len(events) == 1, f"expected 1 KeptAlive, got {len(events)}"
     args = events[0]["args"]
     assert args["caller"] == GAS_BOY_ADDR
     assert args["batchId"] == batch_id
-    assert args["payer"] == payer_addr
-    assert args["topUpPerChunk"] == threshold
+    assert args["payer"] == addr
+    assert args["perChunk"] == expected_per_chunk
     assert args["totalAmount"] == expected_total
 
-    # Balance deltas.
-    assert bzz.functions.balanceOf(payer_addr).call() == payer_bzz_before - expected_total
+    assert bzz.functions.balanceOf(addr).call() == bzz_before - expected_total
     assert bzz.functions.balanceOf(stamp.address).call() == stamp_bzz_before + expected_total
-
-    # normalisedBalance advanced by threshold.
-    assert stamp.functions.batches(batch_id).call()[4] == norm_bal_before + threshold
-
-    # Not due anymore.
+    # Post-topup remaining should equal exactly target (precise idempotent)
+    norm_bal_after = stamp.functions.batches(batch_id).call()[4]
+    cto_after = stamp.functions.currentTotalOutPayment().call()
+    assert norm_bal_after - cto_after == target
     assert not registry.functions.isDue(batch_id).call()
 
 
-def test_40_hysteresis_second_trigger_noop(w3, wrangler_dev, contracts, batch_id, payer):
+def test_40_idempotent_second_cron_strict_noop(w3, wrangler_dev, contracts, batch_id, participant):
     registry = contracts["registry"]
     bzz = contracts["bzz"]
-    payer_addr = Web3.to_checksum_address(payer["address"])
+    addr = Web3.to_checksum_address(participant["address"])
 
-    payer_bzz_before = bzz.functions.balanceOf(payer_addr).call()
+    bzz_before = bzz.functions.balanceOf(addr).call()
     nonce_before = w3.eth.get_transaction_count(GAS_BOY_ADDR)
     before_block = w3.eth.block_number
 
-    result = _trigger()
-    print(f"[hysteresis] result = {result}")
+    result = _cron()
+    print(f"[idempotent] result = {result}")
 
     assert result["ok"] is True
     assert result.get("dueCount") == 0
     assert w3.eth.get_transaction_count(GAS_BOY_ADDR) == nonce_before
-    assert bzz.functions.balanceOf(payer_addr).call() == payer_bzz_before
-    assert _kept_alive_events(w3, registry, before_block) == []
+    assert bzz.functions.balanceOf(addr).call() == bzz_before
+    assert _kept_alive_events(registry, before_block) == []
 
 
-def test_50_next_cycle_tops_up_again(w3, wrangler_dev, contracts, batch_id, payer):
+def test_50_next_cycle_tops_up_again(w3, wrangler_dev, contracts, batch_id, participant):
     registry = contracts["registry"]
     stamp = contracts["stamp"]
     bzz = contracts["bzz"]
-    payer_addr = Web3.to_checksum_address(payer["address"])
+    addr = Web3.to_checksum_address(participant["address"])
 
-    mined = _mine_until_due(w3, registry, stamp, batch_id, EXTENSION_BLOCKS)
-    print(f"[cycle2] mined {mined} blocks to trigger second due state")
+    mined = _mine_until_due(w3, registry, stamp, batch_id, GRACE_BLOCKS)
+    print(f"[cycle2] mined {mined} blocks")
 
     price = stamp.functions.lastPrice().call()
     depth = stamp.functions.batches(batch_id).call()[1]
-    threshold = price * EXTENSION_BLOCKS
-    expected_total = threshold << depth
     norm_bal_before = stamp.functions.batches(batch_id).call()[4]
-    payer_bzz_before = bzz.functions.balanceOf(payer_addr).call()
+    cto_before = stamp.functions.currentTotalOutPayment().call()
+    remaining_before = norm_bal_before - cto_before
+    target = price * GRACE_BLOCKS
+    expected_per_chunk = target - remaining_before
+    expected_total = expected_per_chunk << depth
+    bzz_before = bzz.functions.balanceOf(addr).call()
     before_block = w3.eth.block_number
 
-    result = _trigger()
+    result = _cron()
     print(f"[cycle2] result = {result}")
 
     assert result["ok"] is True and result["dueCount"] == 1
-
-    events = _kept_alive_events(w3, registry, before_block)
+    events = _kept_alive_events(registry, before_block)
     assert len(events) == 1
     assert events[0]["args"]["totalAmount"] == expected_total
 
-    assert stamp.functions.batches(batch_id).call()[4] == norm_bal_before + threshold
-    assert bzz.functions.balanceOf(payer_addr).call() == payer_bzz_before - expected_total
+    norm_bal_after = stamp.functions.batches(batch_id).call()[4]
+    cto_after = stamp.functions.currentTotalOutPayment().call()
+    assert norm_bal_after - cto_after == target
+    assert bzz.functions.balanceOf(addr).call() == bzz_before - expected_total
     assert not registry.functions.isDue(batch_id).call()
 
 
-def test_60_failing_sub_emits_skipped(w3, wrangler_dev, contracts, batch_id, payer):
-    """If the payer revokes allowance, keepalive should skip that batch,
-    emit KeepaliveSkipped, and gas-boy's HTTP handler should still 200."""
+def test_60_failing_pull_emits_skipped(w3, wrangler_dev, contracts, batch_id, participant):
+    """Payer revokes allowance → keepalive's per-volume try/catch emits
+    KeepaliveSkipped; gas-boy's scheduled still completes cleanly."""
     registry = contracts["registry"]
     bzz = contracts["bzz"]
-    payer_key = "0x" + payer["signing_key"]
-    payer_addr = Web3.to_checksum_address(payer["address"])
+    key = "0x" + participant["signing_key"]
+    addr = Web3.to_checksum_address(participant["address"])
 
-    # Revoke allowance.
-    tx = bzz.functions.approve(registry.address, 0).build_transaction(_tx_defaults(w3, payer_addr))
-    _send(w3, payer_key, tx)
-    assert bzz.functions.allowance(payer_addr, registry.address).call() == 0
+    _send(w3, key, bzz.functions.approve(registry.address, 0).build_transaction(
+        _tx_defaults(w3, addr)))
+    assert bzz.functions.allowance(addr, registry.address).call() == 0
 
-    # Drive to due.
-    _mine_until_due(w3, registry, contracts["stamp"], batch_id, EXTENSION_BLOCKS)
+    _mine_until_due(w3, registry, contracts["stamp"], batch_id, GRACE_BLOCKS)
     assert registry.functions.isDue(batch_id).call()
 
     before_block = w3.eth.block_number
-    payer_bzz_before = bzz.functions.balanceOf(payer_addr).call()
+    bzz_before = bzz.functions.balanceOf(addr).call()
 
-    result = _trigger()
-    print(f"[fail-sub] result = {result}")
+    result = _cron()
+    print(f"[fail-pull] result = {result}")
 
-    # Worker still reports ok (the tx itself succeeded — keepalive's try/catch
-    # per-batch means the wrapping transaction doesn't revert).
     assert result["ok"] is True
     assert result["dueCount"] == 1
 
-    skipped = _skipped_events(w3, registry, before_block)
-    kept = _kept_alive_events(w3, registry, before_block)
+    skipped = _skipped_events(registry, before_block)
+    kept = _kept_alive_events(registry, before_block)
     assert len(skipped) == 1, f"expected KeepaliveSkipped, got {len(skipped)}"
     assert skipped[0]["args"]["batchId"] == batch_id
     assert kept == []
-    # No BZZ moved.
-    assert bzz.functions.balanceOf(payer_addr).call() == payer_bzz_before
+    assert bzz.functions.balanceOf(addr).call() == bzz_before
 
     # Restore allowance so cleanup is clean for reruns.
-    tx = bzz.functions.approve(registry.address, 2**256 - 1).build_transaction(_tx_defaults(w3, payer_addr))
-    _send(w3, payer_key, tx)
+    _send(w3, key, bzz.functions.approve(registry.address, 2**256 - 1).build_transaction(
+        _tx_defaults(w3, addr)))

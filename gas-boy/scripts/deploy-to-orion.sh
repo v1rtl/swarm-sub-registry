@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy SubscriptionRegistry to the orion anvil devnet.
+# Deploy VolumeRegistry to the orion anvil devnet.
 #
 # Reads:
 #   orion/state/chain.json       (rpc, deployer_key)
@@ -40,13 +40,13 @@ cd "$REPO_ROOT/contracts"
 # `forge script --broadcast` + `--json` emits the run metadata we need.
 # We capture the returns by parsing broadcast/run-latest.json.
 BZZ="$BZZ" POSTAGE_STAMP="$POSTAGE_STAMP" PRIVATE_KEY="$DEPLOYER_KEY" \
-  forge script script/DeploySubscriptionRegistry.s.sol:DeploySubscriptionRegistry \
+  forge script script/DeployVolumeRegistry.s.sol:DeployVolumeRegistry \
     --rpc-url "$RPC" \
     --broadcast \
     --silent
 
 # The registry is the single CREATE tx in the latest broadcast for this chain.
-BROADCAST="$REPO_ROOT/contracts/broadcast/DeploySubscriptionRegistry.s.sol/$CHAIN_ID/run-latest.json"
+BROADCAST="$REPO_ROOT/contracts/broadcast/DeployVolumeRegistry.s.sol/$CHAIN_ID/run-latest.json"
 [[ -f "$BROADCAST" ]] || { echo "broadcast file not found at $BROADCAST" >&2; exit 1; }
 
 REGISTRY_ADDR="$(jq -r '[.transactions[] | select(.transactionType=="CREATE")][0].contractAddress' "$BROADCAST")"
@@ -71,5 +71,5 @@ jq -n \
   > "$REGISTRY_JSON"
 
 echo
-echo "SubscriptionRegistry deployed at: $REGISTRY_ADDR"
+echo "VolumeRegistry deployed at: $REGISTRY_ADDR"
 echo "State written to: $REGISTRY_JSON"

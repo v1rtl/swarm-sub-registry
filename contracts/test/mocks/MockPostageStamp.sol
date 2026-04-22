@@ -4,8 +4,8 @@ pragma solidity ^0.8.19;
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 
 /// @dev Test double that mimics the subset of PostageStamp used by
-/// `SubscriptionRegistry`. State is directly settable so tests can
-/// construct exact scenarios.
+/// `VolumeRegistry`. State is directly settable so tests can construct
+/// exact scenarios.
 contract MockPostageStamp {
     struct Batch {
         address owner;

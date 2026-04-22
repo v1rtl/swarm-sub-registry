@@ -4,10 +4,10 @@ pragma solidity ^0.8.19;
 import {Script, console2} from "forge-std/Script.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 
-import {SubscriptionRegistry} from "../src/SubscriptionRegistry.sol";
+import {VolumeRegistry} from "../src/VolumeRegistry.sol";
 import {IPostageStamp} from "../src/interfaces/IPostageStamp.sol";
 
-contract DeploySubscriptionRegistry is Script {
+contract DeployVolumeRegistry is Script {
     function run() external {
         // Sepolia defaults; override via env vars for other chains
         address bzz = vm.envOr(
@@ -21,13 +21,13 @@ contract DeploySubscriptionRegistry is Script {
         uint256 pk = vm.envUint("PRIVATE_KEY");
 
         vm.startBroadcast(pk);
-        SubscriptionRegistry reg = new SubscriptionRegistry(
+        VolumeRegistry reg = new VolumeRegistry(
             IERC20(bzz),
             IPostageStamp(stamp)
         );
         vm.stopBroadcast();
 
-        console2.log("SubscriptionRegistry deployed at:", address(reg));
+        console2.log("VolumeRegistry deployed at:", address(reg));
         console2.log("  BZZ token:           ", bzz);
         console2.log("  PostageStamp:       ", stamp);
     }

@@ -61,9 +61,9 @@ function buildClients(env: Env): {
 }
 
 /**
- * Read all batchIds via subscriptionCount + a single multicall, then
- * fetch (isDue, isDead) for each id via a second multicall. Constant
- * 3 RPC round-trips regardless of subscription count.
+ * Read all batchIds via volumeCount + a single multicall, then fetch
+ * (isDue, isDead) for each id via a second multicall. Constant 3 RPC
+ * round-trips regardless of volume count.
  */
 async function collectActionable(
   client: PublicClient,
@@ -73,7 +73,7 @@ async function collectActionable(
     await client.readContract({
       address: registry,
       abi: registryAbi,
-      functionName: "subscriptionCount",
+      functionName: "volumeCount",
     }),
   );
   if (total === 0) return { total: 0, due: [], dead: [] };

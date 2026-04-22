@@ -3,7 +3,7 @@ pragma solidity ^0.8.19;
 
 /// @title IPostageStamp
 /// @notice Minimal surface of Swarm's PostageStamp contract used by
-/// `SubscriptionRegistry`.
+/// `VolumeRegistry`.
 /// @dev Matches the ABI of
 /// https://github.com/ethersphere/storage-incentives/blob/master/src/PostageStamp.sol
 interface IPostageStamp {

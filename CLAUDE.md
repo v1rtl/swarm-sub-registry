@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **swarm-sub-registry** is a multi-component Ethereum/Swarm infrastructure project:
 
-- **contracts/** — Solidity (Foundry). `SubscriptionRegistry`: permissionless keepalive service for Swarm postage stamp batches. Payers subscribe batches; anyone can call `keepalive()` to top up batches whose remaining balance falls below threshold.
+- **contracts/** — Solidity (Foundry). `VolumeRegistry`: volume-lifecycle layer over Swarm postage stamp batches with a three-role model (volume owner, payer, chunk signer). Owner creates volumes; payer authorization is a two-party handshake (owner designates, payer confirms); anyone can call `keepalive()` to top up volumes whose remaining balance falls below `graceBlocks × lastPrice`.
 - **orion/** — Python (uv/hatch). Local test harness construction kit for EVM protocols. Three-layer model: chain (anvil lifecycle) → constellation (declarative contract deploy with role wiring) → participants (deterministic key derivation + provisioning). CLI entry point: `orion`.
-- **gas-boy/** — TypeScript (Cloudflare Worker). Cron-based bot that calls `SubscriptionRegistry.keepalive()` and `pruneDead()`. Uses viem (incl. multicall) for EVM interaction.
+- **gas-boy/** — TypeScript (Cloudflare Worker). Cron-based bot that calls `VolumeRegistry.keepalive()` and `pruneDead()`. Uses viem (incl. multicall) for EVM interaction.
 
 ## Build & Test Commands
 
@@ -40,14 +40,29 @@ Use bun, not npm. `bun.lock` is the lockfile of record.
 
 ## Architecture
 
-### SubscriptionRegistry contract
-- `subscribe(batchId, extensionBlocks)` stores a `Subscription{payer, extensionBlocks}`
-- `keepalive()` iterates all subscriptions; if `remainingPerChunk < lastPrice * extensionBlocks`, tops up using payer's pre-approved BZZ. Per-batch failures are isolated via `try/catch` and emitted as `KeepaliveSkipped`.
-- `keepaliveOne(batchId)` / `pruneOne(batchId)` — singular variants. Reverts bubble through to the caller (no try/catch) so explicit callers learn exactly why their call failed.
-- `pruneDead(batchIds[])` — permissionless cleanup of subscriptions whose batch is no longer known to PostageStamp (`owner == 0`: never created, or reaped by `expireLimited` after expiry). Per-id failures emit `PruneSkipped` with the revert selector embedded; `Pruned` event on success. Pruning is **irreversible** — payer must re-subscribe if the batch is re-created.
+### VolumeRegistry contract
+Three-role model (volume owner, payer, chunk signer). Key types:
+- `struct Account { address payer; bool active; }` keyed by owner.
+- `struct Volume { address owner; address chunkSigner; uint64 ttlExpiry; uint8 initialDepth; uint32 graceBlocks; }`.
+
+**Account handshake (owner ↔ payer).** Two-party, prevents unilateral self-install:
+- `designatePayer(payer)` — owner picks a payer (pre-confirm).
+- `confirmAccount(owner)` — payer (msg.sender) confirms; requires `designated[owner] == msg.sender`. Sets `accounts[owner] = {payer, active:true}`.
+- `revokeAccount(owner)` — either the owner or the confirmed payer can dissolve. Affects **every** volume managed by the (owner, payer) pair — payer is not stored per-volume.
+
+**Volume lifecycle.** Owner-only:
+- `createVolume(batchId, chunkSigner, ttlExpiry, graceBlocks)` — asserts `PostageStamp.batches(id).owner == chunkSigner` so v1 keeps the postage-batch-owner and the declared chunk signer aligned. Records `initialDepth` from PostageStamp at creation time.
+- `modifyVolume(batchId, newTtlExpiry, newGraceBlocks)` — adjust expiry/grace only. Depth and chunkSigner are frozen.
+- `extendVolume(batchId, newDepth)` — **unconditionally reverts with `DepthUnsupported`** (aka "Batch depth increase not supported in v1"). Depth changes are not supported in v1; because the registry's API never calls `PostageStamp.increaseDepth`, no depth change can flow through this contract.
+- `deleteVolume(batchId)` — permanent removal.
+- `transferOwnership(batchId, newOwner)` — hand off management.
+
+**Keepalive.** Precise idempotent top-up:
+- `keepalive()` iterates all volumes; tops up any whose batch `remainingPerChunk < graceBlocks × lastPrice`. `perChunk = target - remaining` so consecutive calls in the same block are strict no-ops. Per-volume failures emit `KeepaliveSkipped`.
+- `keepaliveOne(batchId)` — singular, reverts bubble.
+- `pruneDead(batchIds[])` / `pruneOne(batchId)` — permissionless cleanup when `isDead(id)` is true (volume's `ttlExpiry` passed, OR `PostageStamp.batches(id).owner == 0`). Per-id failures emit `PruneSkipped` with the revert selector embedded.
 - `isDue(batchId)` / `isDead(batchId)` — view helpers used by gas-boy via multicall.
 - Constructor pre-approves the PostageStamp contract for unlimited BZZ spending.
-- Payer revoking allowance makes their batch un-keepable (bulk `keepalive()` emits `KeepaliveSkipped` and continues; singular `keepaliveOne()` reverts).
 
 ### orion layers
 Each layer writes a JSON state file (in `orion/state/`, gitignored) consumed by the next:
@@ -59,7 +74,7 @@ Each layer writes a JSON state file (in `orion/state/`, gitignored) consumed by 
 The built-in **Swarm profile** (`profiles/swarm.py`) deploys 5 contracts (TestToken, PostageStamp, PriceOracle, StakeRegistry, Redistribution) with 4 role grants. Uses testnet TestToken artifact (mainnet Token is a bridge shim, not deployable).
 
 ### gas-boy
-Cloudflare Worker with `GET /health` and a `scheduled` cron handler. Each cycle: reads all subscriptions in 3 RPC round-trips via Multicall3 (`subscriptionCount` + bulk `batchIds` + bulk `isDue`/`isDead`), then sends `keepalive()` if any are due and `pruneDead()` if any are dead. Sequential txs, each with independent simulate + receipt + log entry. Fire-and-observe pattern (never throws from scheduled).
+Cloudflare Worker with `GET /health` and a `scheduled` cron handler. Each cycle: reads all volumes in 3 RPC round-trips via Multicall3 (`volumeCount` + bulk `batchIds` + bulk `isDue`/`isDead`), then sends `keepalive()` if any are due and `pruneDead()` if any are dead. Sequential txs, each with independent simulate + receipt + log entry. Fire-and-observe pattern (never throws from scheduled).
 
 ## Key Pitfalls
 
