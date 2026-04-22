@@ -1,0 +1,5 @@
+# Copy to .dev.vars and fill in.
+# For orion local dev, use anvil's prefunded account #1 (NOT op-0, so the
+# keepalive caller is distinct from the payer, letting tests assert
+# KeptAlive.caller correctly).
+PRIVATE_KEY="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"

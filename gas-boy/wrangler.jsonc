@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gas-boy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    // Local-dev defaults (orion anvil). Override per-env below.
+    // REGISTRY_ADDRESS is injected at launch time by scripts/start-dev.sh
+    // (read from orion/state/registry.json) or by `wrangler deploy` env.
+    "RPC_URL": "http://127.0.0.1:8545",
+    "CHAIN_ID": "31337",
+    "REGISTRY_ADDRESS": "0x0000000000000000000000000000000000000000"
+  },
+  "triggers": {
+    // Testing: fire every minute.
+    "crons": ["* * * * *"]
+  },
+  "env": {
+    "production": {
+      "vars": {
+        "RPC_URL": "https://ethereum-sepolia-rpc.publicnode.com",
+        "CHAIN_ID": "11155111",
+        "REGISTRY_ADDRESS": "0x700c91Ca6A3CA787f3269A369a336bf69a73b5C7"
+      },
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
+    }
+  }
+}

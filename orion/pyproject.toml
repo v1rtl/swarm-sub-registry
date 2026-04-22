@@ -21,3 +21,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orion"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-timeout>=2.3",
+]
+
+[tool.pytest.ini_options]
+timeout = 180
+timeout_method = "thread"
