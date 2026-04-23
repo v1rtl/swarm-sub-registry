@@ -7,11 +7,13 @@
   "observability": { "enabled": true },
   "vars": {
     // Local-dev defaults (orion anvil). Override per-env below.
-    // REGISTRY_ADDRESS is injected at launch time by scripts/start-dev.sh
-    // (read from orion/state/registry.json) or by `wrangler deploy` env.
+    // REGISTRY_ADDRESS + POSTAGE_ADDRESS are injected at launch time by
+    // scripts/start-dev.sh (read from orion/state/registry.json) or by
+    // `wrangler deploy` env.
     "RPC_URL": "http://127.0.0.1:8545",
     "CHAIN_ID": "31337",
-    "REGISTRY_ADDRESS": "0x0000000000000000000000000000000000000000"
+    "REGISTRY_ADDRESS": "0x0000000000000000000000000000000000000000",
+    "POSTAGE_ADDRESS": "0x0000000000000000000000000000000000000000"
   },
   "triggers": {
     // Testing: fire every minute.
@@ -22,7 +24,8 @@
       "vars": {
         "RPC_URL": "https://ethereum-sepolia-rpc.publicnode.com",
         "CHAIN_ID": "11155111",
-        "REGISTRY_ADDRESS": "0x993f923De49DA0C83e7434A1b35988D1cF79fF21"
+        "REGISTRY_ADDRESS": "0x0000000000000000000000000000000000000000",
+        "POSTAGE_ADDRESS": "0xcdfdC3752caaA826fE62531E0000C40546eC56A6"
       },
       "triggers": {
         "crons": ["*/5 * * * *"]

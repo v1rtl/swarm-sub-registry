@@ -107,6 +107,7 @@ Entry edges to `Retired`:
 - `Retired.VolumeExpired` — `ttlExpiry != 0 && now >= ttlExpiry`; detected by next trigger or by anyone calling `reap(volumeId)`.
 - `Retired.BatchDied` — Postage reports batch no longer existing (balance exhausted or never existed).
 - `Retired.DepthChanged` — Postage reports depth ≠ `volume.depth`.
+- `Retired.BatchOwnerMismatch` — Postage reports `batches(id).owner != volume.chunkSigner`. Defensive branch; current PostageStamp does not mutate batch owner, but the paymaster checks it to keep I2 tight against future upstream changes.
 
 ### 6.2 Account
 
@@ -223,7 +224,7 @@ The check order matters: batch/depth/TTL retire-edges are evaluated before auth/
 
 ```
 event VolumeCreated(bytes32 indexed volumeId, address indexed owner, address chunkSigner, uint8 depth, uint64 ttlExpiry);
-event VolumeRetired(bytes32 indexed volumeId, uint8 reason);  // OwnerDeleted | VolumeExpired | BatchDied | DepthChanged
+event VolumeRetired(bytes32 indexed volumeId, uint8 reason);  // OwnerDeleted | VolumeExpired | BatchDied | DepthChanged | BatchOwnerMismatch
 event VolumeOwnershipTransferred(bytes32 indexed volumeId, address indexed from, address indexed to);
 
 event PayerDesignated(address indexed owner, address payer);

@@ -4,3 +4,7 @@
 [submodule "orion/vendor/storage-incentives"]
 	path = orion/vendor/storage-incentives
 	url = https://github.com/ethersphere/storage-incentives.git
+[submodule "contracts/lib/openzeppelin-contracts"]
+	path = contracts/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts.git
+	branch = release-v4.9

@@ -10,43 +10,38 @@ import {
 } from "viem";
 import { sepolia, foundry } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
-import { registryAbi } from "./abi";
+import { registryAbi, postageAbi } from "./abi";
 
 export interface Env {
   RPC_URL: string;
   CHAIN_ID: string;
   REGISTRY_ADDRESS: `0x${string}`;
+  POSTAGE_ADDRESS: `0x${string}`;
   PRIVATE_KEY: string;
+  // Page size for getActiveVolumes; default 100 if unset.
+  PAGE_SIZE?: string;
 }
 
 export interface RunResult {
   ok: boolean;
   skipped?: string;
-  totalSubs?: number;
+  activeCount?: number;
   dueCount?: number;
-  deadCount?: number;
+  pagesRead?: number;
   txHash?: Hex;
-  blockNumber?: string; // bigint-as-string for JSON-safe logs
+  blockNumber?: string;
   gasUsed?: string;
   error?: string;
-  pruneTxHash?: Hex;
-  pruneBlockNumber?: string;
-  pruneGasUsed?: string;
-  pruneError?: string;
   durationMs: number;
 }
 
-// Canonical Multicall3 address (same on every EVM chain it has been
-// published on). viem's `sepolia` chain ships with this configured; its
-// `foundry` chain does NOT (as of viem 2.48), so we inject it ourselves
-// for the local-dev path. orion's Chain.up() pre-deploys the bytecode
-// at this address via anvil_setCode, matching this config.
+// Canonical Multicall3 address. orion injects this at anvil setup via
+// anvil_setCode; live Sepolia ships it natively.
 const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
 
 function buildChain(env: Env): Chain {
   const id = Number(env.CHAIN_ID);
-  const base =
-    id === 11155111 ? sepolia : id === 31337 ? foundry : null;
+  const base = id === 11155111 ? sepolia : id === 31337 ? foundry : null;
   if (!base) throw new Error(`unsupported CHAIN_ID: ${env.CHAIN_ID}`);
   return {
     ...base,
@@ -72,84 +67,163 @@ function buildClients(env: Env): {
   return { publicClient, walletClient, account, chain };
 }
 
+interface VolumeView {
+  volumeId: `0x${string}`;
+  owner: `0x${string}`;
+  payer: `0x${string}`;
+  chunkSigner: `0x${string}`;
+  createdAt: bigint;
+  ttlExpiry: bigint;
+  depth: number;
+  status: number;
+  accountActive: boolean;
+}
+
 /**
- * Read all batchIds via volumeCount + a single multicall, then fetch
- * (isDue, isDead) for each id via a second multicall. Constant 3 RPC
- * round-trips regardless of volume count.
+ * Diagnostic: assert Multicall3 bytecode is present. Returns error
+ * message if missing; undefined if OK. Callers log and skip the cycle
+ * on failure — multicall-returning-zeros is a silent footgun.
  */
-async function collectActionable(
+async function assertMulticall3(client: PublicClient): Promise<string | undefined> {
+  const code = await client.getCode({ address: MULTICALL3_ADDRESS });
+  if (!code || code === "0x") {
+    return `Multicall3 missing at ${MULTICALL3_ADDRESS} — orion must inject it via anvil_setCode`;
+  }
+  return undefined;
+}
+
+/**
+ * Page through getActiveVolumes to collect every Active volume. One
+ * multicall for getActiveVolumeCount + ceil(n/PAGE) multicalls for pages.
+ */
+async function collectActiveVolumes(
   client: PublicClient,
   registry: `0x${string}`,
-): Promise<{ total: number; due: `0x${string}`[]; dead: `0x${string}`[] }> {
+  pageSize: number,
+): Promise<{ volumes: VolumeView[]; pages: number }> {
   const total = Number(
     await client.readContract({
       address: registry,
       abi: registryAbi,
-      functionName: "volumeCount",
+      functionName: "getActiveVolumeCount",
     }),
   );
-  if (total === 0) return { total: 0, due: [], dead: [] };
+  if (total === 0) return { volumes: [], pages: 0 };
 
-  // Each contract entry needs `as const` so viem can narrow `functionName`
-  // back to the specific abi item; without it, multicall infers a union
-  // of every possible output across registryAbi.
-  const ids = await client.multicall({
-    contracts: Array.from(
-      { length: total },
-      (_, i) =>
-        ({
-          address: registry,
-          abi: registryAbi,
-          functionName: "batchIds",
-          args: [BigInt(i)],
-        }) as const,
-    ),
-    allowFailure: false,
-  });
-
-  const flags = await client.multicall({
-    contracts: ids.flatMap(
-      (id) =>
-        [
-          {
-            address: registry,
-            abi: registryAbi,
-            functionName: "isDue",
-            args: [id],
-          } as const,
-          {
-            address: registry,
-            abi: registryAbi,
-            functionName: "isDead",
-            args: [id],
-          } as const,
-        ] as const,
-    ),
-    allowFailure: false,
-  });
-
-  const due: `0x${string}`[] = [];
-  const dead: `0x${string}`[] = [];
-  ids.forEach((id, i) => {
-    if (flags[2 * i]) due.push(id);
-    if (flags[2 * i + 1]) dead.push(id);
-  });
-  return { total, due, dead };
+  const pageCount = Math.ceil(total / pageSize);
+  const pagePromises = Array.from({ length: pageCount }, (_, i) =>
+    client.readContract({
+      address: registry,
+      abi: registryAbi,
+      functionName: "getActiveVolumes",
+      args: [BigInt(i * pageSize), BigInt(pageSize)],
+    }),
+  );
+  const pages = await Promise.all(pagePromises);
+  const volumes = pages.flat() as unknown as VolumeView[];
+  return { volumes, pages: pageCount };
 }
 
 /**
- * The core of gas-boy. Each cron cycle:
- *   1. read all subscriptions, classify due / dead via multicall
- *   2. if any due: send `keepalive()`
- *   3. if any dead: send `pruneDead(dead)`
+ * Client-side filter: which volumes are likely to benefit from a
+ * trigger tx? We proposals all volumes whose batch is observed to be
+ * below the registry's topup target. The contract itself is the source
+ * of truth — retire/skip edges are evaluated on-chain during trigger —
+ * so false positives here are harmless (emit Toppedup with amount=0 is
+ * impossible; the contract returns silently).
  *
- * Both txs are independent; either may fail without affecting the other.
+ * A volume is marked "due" iff:
+ *   - status == Active, AND
+ *   - accountActive (else trigger would just emit TopupSkipped(NoAuth)
+ *     and burn gas for nothing), AND
+ *   - PostageStamp reports a live batch (owner != 0 and not expired),
+ *     AND the remaining per-chunk < target per-chunk.
+ */
+async function filterDue(
+  client: PublicClient,
+  postage: `0x${string}`,
+  registry: `0x${string}`,
+  volumes: VolumeView[],
+): Promise<VolumeView[]> {
+  if (volumes.length === 0) return [];
+
+  // One multicall: [lastPrice, graceBlocks, currentTotalOutPayment, ...batches(id)]
+  const base = [
+    {
+      address: postage,
+      abi: postageAbi,
+      functionName: "lastPrice",
+    } as const,
+    {
+      address: registry,
+      abi: registryAbi,
+      functionName: "graceBlocks",
+    } as const,
+    {
+      address: postage,
+      abi: postageAbi,
+      functionName: "currentTotalOutPayment",
+    } as const,
+  ];
+  const batchReads = volumes.map(
+    (v) =>
+      ({
+        address: postage,
+        abi: postageAbi,
+        functionName: "batches",
+        args: [v.volumeId],
+      }) as const,
+  );
+
+  const results = await client.multicall({
+    contracts: [...base, ...batchReads],
+    allowFailure: false,
+  });
+
+  const lastPrice = results[0] as unknown as bigint;
+  const graceBlocks = results[1] as unknown as bigint;
+  const outpayment = results[2] as unknown as bigint;
+  const target = lastPrice * graceBlocks;
+
+  const due: VolumeView[] = [];
+  for (let i = 0; i < volumes.length; ++i) {
+    const v = volumes[i]!;
+    if (!v.accountActive) continue;
+    const batch = results[3 + i] as unknown as readonly [
+      `0x${string}`,
+      number,
+      number,
+      boolean,
+      bigint,
+      bigint,
+    ];
+    const batchOwner = batch[0];
+    const batchDepth = batch[1];
+    const normalisedBalance = batch[4];
+    if (batchOwner === "0x0000000000000000000000000000000000000000") continue;
+    if (batchDepth !== v.depth) continue; // retire edge, not a topup
+    if (normalisedBalance <= outpayment) continue; // dead
+    if (batchOwner.toLowerCase() !== v.chunkSigner.toLowerCase()) continue;
+    const remaining = normalisedBalance - outpayment;
+    if (remaining < target) due.push(v);
+  }
+  return due;
+}
+
+/**
+ * The core of gas-boy. One cycle:
+ *   1. assert Multicall3 present (else skip with explicit log).
+ *   2. page getActiveVolumes → VolumeView[].
+ *   3. client-side filter → due ids.
+ *   4. if due is non-empty: send trigger(ids[]).
+ *
  * Never throws — all errors captured into RunResult so the scheduled
  * handler can log them without retry storms.
  */
-export async function runKeepalive(env: Env): Promise<RunResult> {
+export async function runCycle(env: Env): Promise<RunResult> {
   const started = Date.now();
   const duration = () => Date.now() - started;
+  const pageSize = env.PAGE_SIZE ? Number(env.PAGE_SIZE) : 100;
 
   let publicClient: PublicClient;
   let walletClient: WalletClient;
@@ -165,18 +239,31 @@ export async function runKeepalive(env: Env): Promise<RunResult> {
     };
   }
 
-  const registry = env.REGISTRY_ADDRESS;
-  const result: RunResult = { ok: true, durationMs: 0 };
+  const multicallErr = await assertMulticall3(publicClient);
+  if (multicallErr) {
+    return { ok: false, error: multicallErr, durationMs: duration() };
+  }
 
-  let due: `0x${string}`[] = [];
-  let dead: `0x${string}`[] = [];
+  const result: RunResult = { ok: true, durationMs: 0 };
+  const registry = env.REGISTRY_ADDRESS;
+  const postage = env.POSTAGE_ADDRESS;
+
+  let due: VolumeView[] = [];
   try {
-    const collected = await collectActionable(publicClient, registry);
-    result.totalSubs = collected.total;
-    result.dueCount = collected.due.length;
-    result.deadCount = collected.dead.length;
-    due = collected.due;
-    dead = collected.dead;
+    const { volumes, pages } = await collectActiveVolumes(
+      publicClient,
+      registry,
+      pageSize,
+    );
+    result.activeCount = volumes.length;
+    result.pagesRead = pages;
+    if (volumes.length === 0) {
+      result.skipped = "no active volumes";
+      result.durationMs = duration();
+      return result;
+    }
+    due = await filterDue(publicClient, postage, registry, volumes);
+    result.dueCount = due.length;
   } catch (err) {
     result.ok = false;
     result.error = err instanceof Error ? err.message : String(err);
@@ -184,71 +271,39 @@ export async function runKeepalive(env: Env): Promise<RunResult> {
     return result;
   }
 
-  if (due.length === 0 && dead.length === 0) {
-    result.skipped = "no subscriptions actionable";
+  if (due.length === 0) {
+    result.skipped = "no due volumes";
     result.durationMs = duration();
     return result;
   }
 
-  if (due.length > 0) {
-    try {
-      const { request } = await publicClient.simulateContract({
-        address: registry,
-        abi: registryAbi,
-        functionName: "keepalive",
-        account,
-        chain,
-      });
-      // Budget: 500k base + 400k per due batch, capped at 15M.
-      const gasBudget = 500_000n + 400_000n * BigInt(due.length);
-      const requestWithGas = {
-        ...request,
-        gas: gasBudget < 15_000_000n ? gasBudget : 15_000_000n,
-      };
-      const hash = await walletClient.writeContract(requestWithGas);
-      const receipt = await publicClient.waitForTransactionReceipt({
-        hash,
-        timeout: 60_000,
-      });
-      result.txHash = hash;
-      result.blockNumber = receipt.blockNumber.toString();
-      result.gasUsed = receipt.gasUsed.toString();
-      if (receipt.status !== "success") result.ok = false;
-    } catch (err) {
-      result.ok = false;
-      result.error = err instanceof Error ? err.message : String(err);
-    }
-  }
-
-  if (dead.length > 0) {
-    try {
-      const { request } = await publicClient.simulateContract({
-        address: registry,
-        abi: registryAbi,
-        functionName: "pruneDead",
-        args: [dead],
-        account,
-        chain,
-      });
-      // Budget: 100k base + 60k per dead id, capped at 15M.
-      const gasBudget = 100_000n + 60_000n * BigInt(dead.length);
-      const requestWithGas = {
-        ...request,
-        gas: gasBudget < 15_000_000n ? gasBudget : 15_000_000n,
-      };
-      const hash = await walletClient.writeContract(requestWithGas);
-      const receipt = await publicClient.waitForTransactionReceipt({
-        hash,
-        timeout: 60_000,
-      });
-      result.pruneTxHash = hash;
-      result.pruneBlockNumber = receipt.blockNumber.toString();
-      result.pruneGasUsed = receipt.gasUsed.toString();
-      if (receipt.status !== "success") result.ok = false;
-    } catch (err) {
-      result.ok = false;
-      result.pruneError = err instanceof Error ? err.message : String(err);
-    }
+  try {
+    const ids = due.map((v) => v.volumeId);
+    const { request } = await publicClient.simulateContract({
+      address: registry,
+      abi: registryAbi,
+      functionName: "trigger",
+      args: [ids],
+      account,
+      chain,
+    });
+    // Gas budget: 300k base + 250k per due id, capped at 15M.
+    const gasBudget = 300_000n + 250_000n * BigInt(ids.length);
+    const hash = await walletClient.writeContract({
+      ...request,
+      gas: gasBudget < 15_000_000n ? gasBudget : 15_000_000n,
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash,
+      timeout: 60_000,
+    });
+    result.txHash = hash;
+    result.blockNumber = receipt.blockNumber.toString();
+    result.gasUsed = receipt.gasUsed.toString();
+    if (receipt.status !== "success") result.ok = false;
+  } catch (err) {
+    result.ok = false;
+    result.error = err instanceof Error ? err.message : String(err);
   }
 
   result.durationMs = duration();

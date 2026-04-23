@@ -1,452 +1,489 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
-import {IPostageStamp} from "./interfaces/IPostageStamp.sol";
-
 /// @title VolumeRegistry
-/// @notice Volume-lifecycle layer over Swarm postage stamp batches.
-///
-/// A "volume" is our first-class record bundling together a postage batch
-/// (by id) with:
-///   - an **owner** (manages the volume entry: modify ttl/grace, delete,
-///     transfer ownership);
-///   - a **chunk signer** (the EOA that bee uses to sign uploads — on
-///     PostageStamp this is the batch's `owner` field);
-///   - a **payer** (holds BZZ; the entity charged for keepalive top-ups).
-///
-/// The payer is **not** stored on the volume itself — a single `accounts`
-/// table keys (ownerAddress) → {payer, active}. This mirrors the notes'
-/// guidance: revoking a payer authorization must affect every volume that
-/// shares the (owner, payer) pair.
-///
-/// Payer authorization requires a two-party handshake:
-///   1. `designatePayer(payer)`   — owner picks a payer (pre-confirm)
-///   2. `confirmAccount(owner)`   — payer (msg.sender) confirms
-/// A payer cannot install themselves without the owner's prior
-/// designation. Either party can revoke the authorization at any time.
-///
-/// v1 limitations:
-///   - `extendVolume` is defined but unconditionally reverts with
-///     "Batch depth increase not supported in v1". Depth is frozen at
-///     volume creation time. Keepalive only adjusts TTL via `PostageStamp.topUp`,
-///     never depth.
-///
-/// Block-time reminder (caller must pick `graceBlocks` for the target chain):
-///   - Gnosis Chain (~5 s/block):  24h ≈ 17280 blocks
-///   - Sepolia      (~12 s/block): 24h ≈ 7200  blocks
+/// @notice Volume-lifecycle layer over Swarm postage-stamp batches.
+/// @dev See notes/DESIGN.md for the full specification. This implementation
+///      is a direct mechanical translation of that document and of the
+///      companion notes/TEST-PLAN.md. In particular:
+///        - two-role model (owner / payer), bilateral auth (I4);
+///        - `graceBlocks` is immutable global (§10);
+///        - `volumeId == batchId == keccak256(abi.encode(address(this), nonce))`;
+///        - trigger check-order is: status → batch-dead → owner-mismatch
+///          → depth-changed → TTL-expired → auth → payment (§8);
+///        - retire beats auth-skip; payment-failure does not retire.
+interface IERC20Like {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IPostageStampLike {
+    struct Batch {
+        address owner;
+        uint8 depth;
+        uint8 bucketDepth;
+        bool immutableFlag;
+        uint256 normalisedBalance;
+        uint256 lastUpdatedBlockNumber;
+    }
+
+    function batches(bytes32 id)
+        external
+        view
+        returns (
+            address owner,
+            uint8 depth,
+            uint8 bucketDepth,
+            bool immutableFlag,
+            uint256 normalisedBalance,
+            uint256 lastUpdatedBlockNumber
+        );
+
+    function currentTotalOutPayment() external view returns (uint256);
+
+    function lastPrice() external view returns (uint64);
+
+    function minimumValidityBlocks() external view returns (uint64);
+
+    function minimumInitialBalancePerChunk() external view returns (uint256);
+
+    function createBatch(
+        address owner,
+        uint256 initialBalancePerChunk,
+        uint8 depth,
+        uint8 bucketDepth,
+        bytes32 nonce,
+        bool immutableFlag
+    ) external returns (bytes32);
+
+    function topUp(bytes32 batchId, uint256 topupAmountPerChunk) external;
+}
+
 contract VolumeRegistry {
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Constants / enums
+    // ---------------------------------------------------------------------
+
+    uint8 internal constant STATUS_ACTIVE = 1;
+    uint8 internal constant STATUS_RETIRED = 2;
+
+    // Retire reasons (packed into `VolumeRetired.reason`).
+    uint8 public constant REASON_OWNER_DELETED = 1;
+    uint8 public constant REASON_VOLUME_EXPIRED = 2;
+    uint8 public constant REASON_BATCH_DIED = 3;
+    uint8 public constant REASON_DEPTH_CHANGED = 4;
+    uint8 public constant REASON_BATCH_OWNER_MISMATCH = 5; // defensive branch — DESIGN §6.1
+
+    // TopupSkipped reasons.
+    uint8 public constant SKIP_NO_AUTH = 1;
+    uint8 public constant SKIP_PAYMENT_FAILED = 2;
+
+    // ---------------------------------------------------------------------
     // Types
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+
+    struct Volume {
+        address owner;
+        address chunkSigner;
+        uint64 createdAt;
+        uint64 ttlExpiry; // 0 = no expiry
+        uint8 depth;
+        uint8 status;
+        uint32 activeIndex;
+    }
 
     struct Account {
         address payer;
         bool active;
     }
 
-    struct Volume {
-        address owner;          // volume-management rights
-        address chunkSigner;    // PostageStamp batch.owner; signs bee uploads
-        uint64 ttlExpiry;       // block past which the volume is dead (0 = never)
-        uint8 initialDepth;     // frozen at create time
-        uint32 graceBlocks;     // keepalive target: graceBlocks × price per chunk
+    struct VolumeView {
+        bytes32 volumeId;
+        address owner;
+        address payer; // resolved from accounts[owner]
+        address chunkSigner;
+        uint64 createdAt;
+        uint64 ttlExpiry;
+        uint8 depth;
+        uint8 status;
+        bool accountActive;
     }
 
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
     // Immutable wiring
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
 
-    IERC20 public immutable bzz;
-    IPostageStamp public immutable stamp;
+    IPostageStampLike public immutable postage;
+    IERC20Like public immutable bzz;
+    uint64 public immutable graceBlocks;
 
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
     // Storage
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
 
-    // Owner → designated payer (pre-confirmation).
-    mapping(address => address) public designated;
+    mapping(bytes32 => Volume) internal _volumes;
+    mapping(address => address) public designated; // owner → chosen payer (pre-confirmation)
+    mapping(address => Account) internal _accounts;
 
-    // Owner → confirmed account. An account is (payer, active=true) only
-    // after both designatePayer + confirmAccount have run for the same
-    // (owner, payer) pair.
-    mapping(address => Account) public accounts;
+    bytes32[] internal _activeVolumeIds;
+    uint256 public nextNonce;
 
-    // Volume data, keyed by batchId.
-    mapping(bytes32 => Volume) public volumes;
-
-    // Enumerable list of known batchIds (for keepalive iteration).
-    bytes32[] public batchIds;
-    mapping(bytes32 => uint256) private _indexPlusOne; // 0 = absent
-
-    // Reentrancy guard.
-    uint256 private _locked = 1;
-
-    // ------------------------------------------------------------------
-    // Events
-    // ------------------------------------------------------------------
-
-    event PayerDesignated(address indexed owner, address indexed payer);
-    event AccountConfirmed(address indexed owner, address indexed payer);
-    event AccountRevoked(address indexed owner, address indexed payer, address indexed by);
+    // ---------------------------------------------------------------------
+    // Events  (see DESIGN §9)
+    // ---------------------------------------------------------------------
 
     event VolumeCreated(
-        bytes32 indexed batchId,
+        bytes32 indexed volumeId,
         address indexed owner,
-        address indexed chunkSigner,
-        uint64 ttlExpiry,
-        uint8 initialDepth,
-        uint32 graceBlocks
+        address chunkSigner,
+        uint8 depth,
+        uint64 ttlExpiry
     );
-    event VolumeModified(bytes32 indexed batchId, uint64 ttlExpiry, uint32 graceBlocks);
-    event VolumeDeleted(bytes32 indexed batchId, address indexed owner);
-    event VolumeOwnershipTransferred(bytes32 indexed batchId, address indexed from, address indexed to);
-
-    event KeptAlive(
-        address indexed caller,
-        bytes32 indexed batchId,
-        address indexed payer,
-        uint256 perChunk,
-        uint256 totalAmount
+    event VolumeRetired(bytes32 indexed volumeId, uint8 reason);
+    event VolumeOwnershipTransferred(
+        bytes32 indexed volumeId,
+        address indexed from,
+        address indexed to
     );
-    event KeepaliveSkipped(bytes32 indexed batchId, bytes reason);
 
-    event Pruned(bytes32 indexed batchId, address indexed caller);
-    event PruneSkipped(bytes32 indexed batchId, bytes reason);
+    event PayerDesignated(address indexed owner, address payer);
+    event AccountActivated(address indexed owner, address indexed payer);
+    event AccountRevoked(address indexed owner, address indexed payer, address revoker);
 
-    // ------------------------------------------------------------------
+    event Toppedup(bytes32 indexed volumeId, uint256 amount, uint256 newNormalisedBalance);
+    event TopupSkipped(bytes32 indexed volumeId, uint8 reason);
+
+    // ---------------------------------------------------------------------
     // Errors
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
 
-    error AlreadyExists();
-    error NotExists();
-    error NotOwner();
-    error ZeroGrace();
+    error ZeroAddress();
+    error GraceBlocksBelowFloor(uint64 grace, uint64 floor_);
+    error AccountNotActive();
+    error NotVolumeOwner();
+    error VolumeNotActive();
     error NotDesignated();
-    error NoAccount();
     error NotAuthorizedToRevoke();
-    error ChunkSignerMismatch();
-    error DepthUnsupported();
-    error TransferFromFailed();
-    error OnlySelf();
-    error NotDead();
-    error Reentrancy();
+    error DesignationClearedOnActivate();
 
-    modifier nonReentrant() {
-        if (_locked != 1) revert Reentrancy();
-        _locked = 2;
-        _;
-        _locked = 1;
+    // ---------------------------------------------------------------------
+    // Constructor  (DESIGN §10)
+    // ---------------------------------------------------------------------
+
+    constructor(address _postage, address _bzz, uint64 _graceBlocks) {
+        if (_postage == address(0) || _bzz == address(0)) revert ZeroAddress();
+        uint64 floor_ = IPostageStampLike(_postage).minimumValidityBlocks();
+        if (_graceBlocks < floor_) revert GraceBlocksBelowFloor(_graceBlocks, floor_);
+
+        postage = IPostageStampLike(_postage);
+        bzz = IERC20Like(_bzz);
+        graceBlocks = _graceBlocks;
     }
 
-    // ------------------------------------------------------------------
-    // Construction
-    // ------------------------------------------------------------------
+    // =====================================================================
+    // Account API  (§7.1, §7.2)
+    // =====================================================================
 
-    constructor(IERC20 _bzz, IPostageStamp _stamp) {
-        bzz = _bzz;
-        stamp = _stamp;
-        // One-time unlimited approval so `stamp.topUp` can spend the BZZ
-        // we pulled from a payer without a per-call `approve`.
-        _bzz.approve(address(_stamp), type(uint256).max);
-    }
-
-    // ------------------------------------------------------------------
-    // Account management (owner ↔ payer handshake)
-    // ------------------------------------------------------------------
-
-    /// @notice Owner picks a payer. Takes effect only after the payer
-    /// subsequently calls `confirmAccount(owner)`.
-    function designatePayer(address payer) external {
+    /// @notice Owner designates a payer candidate. Pass `address(0)` to clear.
+    /// @dev Unilateral — does not grant any spend permission until the payer
+    ///      confirms via `confirmAuth(msg.sender)`.
+    function designateFundingWallet(address payer) external {
         designated[msg.sender] = payer;
         emit PayerDesignated(msg.sender, payer);
     }
 
-    /// @notice Payer (msg.sender) confirms they will fund `owner`'s
-    /// volumes. Reverts if the owner has not designated msg.sender.
-    function confirmAccount(address owner) external {
+    /// @notice Payer confirms a previously-designated owner→payer pairing.
+    ///         Atomic overwrite of any prior `accounts[owner]`.
+    function confirmAuth(address owner) external {
         if (designated[owner] != msg.sender) revert NotDesignated();
-        accounts[owner] = Account({payer: msg.sender, active: true});
-        emit AccountConfirmed(owner, msg.sender);
+        _accounts[owner] = Account({payer: msg.sender, active: true});
+        emit AccountActivated(owner, msg.sender);
     }
 
-    /// @notice Either party (owner or the confirmed payer) may dissolve
-    /// the account. After revocation, keepalive cannot pull from the
-    /// payer until a fresh designate+confirm cycle completes.
-    function revokeAccount(address owner) external {
-        Account memory a = accounts[owner];
-        if (a.payer == address(0)) revert NoAccount();
-        if (msg.sender != owner && msg.sender != a.payer) revert NotAuthorizedToRevoke();
-        delete accounts[owner];
-        delete designated[owner];
-        emit AccountRevoked(owner, a.payer, msg.sender);
+    /// @notice Revoke an account. Callable by the owner or the confirmed payer.
+    ///         Only flips `active`; leaves `payer` intact for possible
+    ///         re-activation via a later `confirmAuth`.
+    function revoke(address owner) external {
+        Account storage acct = _accounts[owner];
+        if (msg.sender != owner && msg.sender != acct.payer) revert NotAuthorizedToRevoke();
+        address payer = acct.payer;
+        acct.active = false;
+        emit AccountRevoked(owner, payer, msg.sender);
     }
 
-    /// @notice Effective payer for `owner`: the confirmed account's payer
-    /// iff active. Self-designation (owner == payer) is allowed but still
-    /// requires the full handshake to eliminate accidental self-pay.
-    function effectivePayer(address owner) public view returns (address) {
-        Account memory a = accounts[owner];
-        if (!a.active) return address(0);
-        return a.payer;
+    function getAccount(address owner) external view returns (Account memory) {
+        return _accounts[owner];
     }
 
-    // ------------------------------------------------------------------
-    // Volume lifecycle
-    // ------------------------------------------------------------------
+    // =====================================================================
+    // Volume lifecycle  (§7.1)
+    // =====================================================================
 
-    /// @notice Register a new volume for an already-created postage
-    /// batch. Asserts the PostageStamp-level owner of the batch equals
-    /// the declared `chunkSigner` so v1 keeps the postage-batch-owner
-    /// and the volume's chunkSigner aligned.
-    /// @param batchId       Existing postage batch.
-    /// @param chunkSigner   EOA that bee will use to sign uploads on this
-    ///                      batch (== `stamp.batches(batchId).owner`).
-    /// @param ttlExpiry     Block number past which this volume is dead.
-    ///                      0 disables volume-level expiry (batch TTL still
-    ///                      governs keepalive).
-    /// @param graceBlocks   Keepalive target: top-ups maintain
-    ///                      `remainingPerChunk ≈ graceBlocks × lastPrice`.
     function createVolume(
-        bytes32 batchId,
         address chunkSigner,
+        uint8 depth,
+        uint8 bucketDepth,
         uint64 ttlExpiry,
-        uint32 graceBlocks
-    ) external {
-        if (graceBlocks == 0) revert ZeroGrace();
-        if (volumes[batchId].owner != address(0)) revert AlreadyExists();
+        bool immutableBatch
+    ) external returns (bytes32 volumeId) {
+        Account storage acct = _accounts[msg.sender];
+        if (!acct.active) revert AccountNotActive();
+        if (chunkSigner == address(0)) revert ZeroAddress();
 
-        (address owner_, uint8 depth,,,,) = stamp.batches(batchId);
-        if (owner_ != chunkSigner) revert ChunkSignerMismatch();
+        // Initial per-chunk balance is contract-computed.
+        uint256 currentPrice = uint256(postage.lastPrice());
+        uint256 perChunk = currentPrice * uint256(graceBlocks);
+        uint256 totalCharge = perChunk << depth;
 
-        volumes[batchId] = Volume({
+        address payer = acct.payer;
+
+        // Pull BZZ from payer → registry. Both `transferFrom`s and
+        // `createBatch` live in the same transaction; any failure reverts
+        // atomically and leaves no state change.
+        require(bzz.transferFrom(payer, address(this), totalCharge), "BZZ_TRANSFER_FAIL");
+        // Approve PostageStamp exactly once per call; leaves no lingering
+        // allowance once createBatch consumes it.
+        require(bzz.approve(address(postage), totalCharge), "BZZ_APPROVE_FAIL");
+
+        bytes32 nonce = bytes32(nextNonce);
+        unchecked {
+            ++nextNonce;
+        }
+        volumeId = postage.createBatch(chunkSigner, perChunk, depth, bucketDepth, nonce, immutableBatch);
+        // Sanity — PostageStamp derives the same way, so this equality is
+        // mechanical; kept as a defensive assertion against upstream drift.
+        require(
+            volumeId == keccak256(abi.encode(address(this), nonce)),
+            "BATCHID_MISMATCH"
+        );
+
+        uint32 idx = uint32(_activeVolumeIds.length);
+        _volumes[volumeId] = Volume({
             owner: msg.sender,
             chunkSigner: chunkSigner,
+            createdAt: uint64(block.timestamp),
             ttlExpiry: ttlExpiry,
-            initialDepth: depth,
-            graceBlocks: graceBlocks
+            depth: depth,
+            status: STATUS_ACTIVE,
+            activeIndex: idx
         });
-        batchIds.push(batchId);
-        _indexPlusOne[batchId] = batchIds.length;
+        _activeVolumeIds.push(volumeId);
 
-        emit VolumeCreated(batchId, msg.sender, chunkSigner, ttlExpiry, depth, graceBlocks);
+        emit VolumeCreated(volumeId, msg.sender, chunkSigner, depth, ttlExpiry);
     }
 
-    /// @notice Update a volume's TTL expiry and/or grace period.
-    /// Depth and chunkSigner are frozen at creation — use
-    /// `extendVolume` for depth (which is not supported in v1).
-    function modifyVolume(bytes32 batchId, uint64 newTtlExpiry, uint32 newGraceBlocks) external {
-        if (newGraceBlocks == 0) revert ZeroGrace();
-        Volume storage v = volumes[batchId];
-        if (v.owner == address(0)) revert NotExists();
-        if (v.owner != msg.sender) revert NotOwner();
-        v.ttlExpiry = newTtlExpiry;
-        v.graceBlocks = newGraceBlocks;
-        emit VolumeModified(batchId, newTtlExpiry, newGraceBlocks);
+    function deleteVolume(bytes32 volumeId) external {
+        Volume storage v = _volumes[volumeId];
+        if (v.owner != msg.sender) revert NotVolumeOwner();
+        if (v.status != STATUS_ACTIVE) revert VolumeNotActive();
+        _retire(volumeId, REASON_OWNER_DELETED);
     }
 
-    /// @notice Unconditionally reverts. Depth changes are not supported
-    /// in v1. Because the registry's API never calls
-    /// `PostageStamp.increaseDepth`, no depth change can flow through
-    /// this contract; the revert documents the policy explicitly.
-    function extendVolume(bytes32, uint8) external pure {
-        revert DepthUnsupported();
-    }
-
-    /// @notice Permanently remove a volume. Owner-only. Irreversible.
-    /// After this, no further keepalive can route topups through this
-    /// volume regardless of account state.
-    function deleteVolume(bytes32 batchId) external {
-        Volume memory v = volumes[batchId];
-        if (v.owner == address(0)) revert NotExists();
-        if (v.owner != msg.sender) revert NotOwner();
-        _remove(batchId);
-        emit VolumeDeleted(batchId, v.owner);
-    }
-
-    /// @notice Hand management rights off to another address. The new
-    /// owner's payer account (if any) takes over — the old owner's
-    /// account is unaffected.
-    function transferOwnership(bytes32 batchId, address newOwner) external {
-        Volume storage v = volumes[batchId];
-        if (v.owner == address(0)) revert NotExists();
-        if (v.owner != msg.sender) revert NotOwner();
-        address from = v.owner;
+    function transferVolumeOwnership(bytes32 volumeId, address newOwner) external {
+        Volume storage v = _volumes[volumeId];
+        if (v.owner != msg.sender) revert NotVolumeOwner();
+        if (v.status != STATUS_ACTIVE) revert VolumeNotActive();
+        if (newOwner == address(0)) revert ZeroAddress();
+        address prev = v.owner;
         v.owner = newOwner;
-        emit VolumeOwnershipTransferred(batchId, from, newOwner);
+        emit VolumeOwnershipTransferred(volumeId, prev, newOwner);
     }
 
-    // ------------------------------------------------------------------
-    // Keepalive
-    // ------------------------------------------------------------------
+    // =====================================================================
+    // Keeper API  (§7.3, §8)
+    // =====================================================================
 
-    /// @notice Iterate all volumes and top up any whose batch balance
-    /// has dropped below `graceBlocks × lastPrice` per chunk. Tops up
-    /// precisely to the target (idempotent: a second call made in the
-    /// same block after a top-up is a strict no-op).
-    function keepalive() external nonReentrant {
-        uint64 price = stamp.lastPrice();
-        uint256 cto = stamp.currentTotalOutPayment();
-        uint256 n = batchIds.length;
+    function trigger(bytes32 volumeId) external {
+        _triggerOne(volumeId);
+    }
+
+    /// @notice Batched trigger. Per-item try/catch: one bad id never aborts
+    ///         the cycle. Reverts from an inner call are swallowed silently
+    ///         (the contract itself only ever emits `TopupSkipped` or
+    ///         `VolumeRetired` on a successful check — the revert path is
+    ///         reserved for malformed input like "volume already retired",
+    ///         which is uninteresting in a batched context).
+    function trigger(bytes32[] calldata volumeIds) external {
+        uint256 n = volumeIds.length;
         for (uint256 i = 0; i < n; ++i) {
-            bytes32 id = batchIds[i];
-            try this._keepaliveOne(id, price, cto) returns (bool toppedUp, address payer, uint256 perChunk, uint256 total) {
-                if (toppedUp) emit KeptAlive(msg.sender, id, payer, perChunk, total);
-            } catch (bytes memory err) {
-                emit KeepaliveSkipped(id, err);
-            }
+            try this._triggerExt(volumeIds[i]) {} catch {}
         }
     }
 
-    /// @notice Keep alive a single volume. Reverts bubble — suitable
-    /// for targeted callers that want to know why the call failed.
-    function keepaliveOne(bytes32 id) external nonReentrant returns (bool toppedUp) {
-        uint64 price = stamp.lastPrice();
-        uint256 cto = stamp.currentTotalOutPayment();
-        address payer;
-        uint256 perChunk;
-        uint256 total;
-        (toppedUp, payer, perChunk, total) = this._keepaliveOne(id, price, cto);
-        if (toppedUp) emit KeptAlive(msg.sender, id, payer, perChunk, total);
+    /// @dev External entry for try/catch wrapping. Never call directly from
+    ///      outside — `trigger(bytes32)` is the public surface.
+    function _triggerExt(bytes32 volumeId) external {
+        require(msg.sender == address(this), "INTERNAL_ONLY");
+        _triggerOne(volumeId);
     }
 
-    /// @dev External only so the bulk `keepalive()` can try/catch on a
-    /// per-volume basis. Restricted to self-calls.
-    function _keepaliveOne(bytes32 id, uint64 price, uint256 cto)
+    /// @notice Retire an Active volume whose TTL has passed. No-op on an
+    ///         already-retired volume. Mostly unnecessary; trigger() handles
+    ///         this edge too.
+    function reap(bytes32 volumeId) external {
+        Volume storage v = _volumes[volumeId];
+        if (v.status != STATUS_ACTIVE) return; // idempotent
+        if (v.ttlExpiry != 0 && block.timestamp >= v.ttlExpiry) {
+            _retire(volumeId, REASON_VOLUME_EXPIRED);
+        }
+    }
+
+    function _triggerOne(bytes32 volumeId) internal {
+        Volume storage v = _volumes[volumeId];
+        // Step 1 — volume must be Active. Revert (not skip) so malformed
+        // single-id calls are loud; batched calls swallow this.
+        if (v.status != STATUS_ACTIVE) revert VolumeNotActive();
+
+        // Step 2 — read Postage batch.
+        (
+            address bOwner,
+            uint8 bDepth,
+            , // bucketDepth
+            , // immutableFlag
+            uint256 bNormalisedBalance,
+
+        ) = postage.batches(volumeId);
+
+        uint256 outpayment = postage.currentTotalOutPayment();
+        bool batchMissing = (bOwner == address(0));
+        bool batchExpired = !batchMissing && (bNormalisedBalance <= outpayment);
+        if (batchMissing || batchExpired) {
+            _retire(volumeId, REASON_BATCH_DIED);
+            return;
+        }
+
+        // Step 2b — owner mismatch (defensive; I2).
+        if (bOwner != v.chunkSigner) {
+            _retire(volumeId, REASON_BATCH_OWNER_MISMATCH);
+            return;
+        }
+
+        // Step 3 — depth mismatch.
+        if (bDepth != v.depth) {
+            _retire(volumeId, REASON_DEPTH_CHANGED);
+            return;
+        }
+
+        // Step 4 — TTL.
+        if (v.ttlExpiry != 0 && block.timestamp >= v.ttlExpiry) {
+            _retire(volumeId, REASON_VOLUME_EXPIRED);
+            return;
+        }
+
+        // Step 5 — auth. After this point, every retire-edge has been
+        // checked; a revoked account only prevents payment, never retires.
+        Account storage acct = _accounts[v.owner];
+        if (!acct.active) {
+            emit TopupSkipped(volumeId, SKIP_NO_AUTH);
+            return;
+        }
+
+        // Step 6 — compute deficit. remaining = normalised − outpayment.
+        uint256 remaining = bNormalisedBalance - outpayment; // strictly positive (expired caught above)
+        uint256 currentPrice = uint256(postage.lastPrice());
+        uint256 target = currentPrice * uint256(graceBlocks);
+        if (remaining >= target) {
+            // I5 idempotence: zero-deficit is a silent no-op.
+            return;
+        }
+        uint256 deficit = target - remaining;
+        uint256 amount = deficit << v.depth;
+
+        // Step 7 — pull BZZ. transferFrom failure is not a retire-edge.
+        try IERC20Like(address(bzz)).transferFrom(acct.payer, address(this), amount) returns (bool ok) {
+            if (!ok) {
+                emit TopupSkipped(volumeId, SKIP_PAYMENT_FAILED);
+                return;
+            }
+        } catch {
+            emit TopupSkipped(volumeId, SKIP_PAYMENT_FAILED);
+            return;
+        }
+
+        // Step 8 — approve & topUp. If this reverts (e.g. Postage paused),
+        // the whole trigger() reverts; batched callers get try/catch-level
+        // isolation. We do NOT swallow it here — a live Postage failure is
+        // a contract-level state worth surfacing.
+        require(bzz.approve(address(postage), amount), "BZZ_APPROVE_FAIL");
+        postage.topUp(volumeId, deficit);
+
+        (, , , , uint256 newBalance, ) = postage.batches(volumeId);
+        emit Toppedup(volumeId, amount, newBalance);
+    }
+
+    // =====================================================================
+    // Views  (§7.4)
+    // =====================================================================
+
+    function getVolume(bytes32 volumeId) external view returns (VolumeView memory) {
+        Volume storage v = _volumes[volumeId];
+        Account storage acct = _accounts[v.owner];
+        return VolumeView({
+            volumeId: volumeId,
+            owner: v.owner,
+            payer: acct.payer,
+            chunkSigner: v.chunkSigner,
+            createdAt: v.createdAt,
+            ttlExpiry: v.ttlExpiry,
+            depth: v.depth,
+            status: v.status,
+            accountActive: acct.active
+        });
+    }
+
+    function getActiveVolumeCount() external view returns (uint256) {
+        return _activeVolumeIds.length;
+    }
+
+    function getActiveVolumes(uint256 offset, uint256 limit)
         external
-        returns (bool toppedUp, address payer, uint256 perChunk, uint256 total)
+        view
+        returns (VolumeView[] memory out)
     {
-        if (msg.sender != address(this)) revert OnlySelf();
-
-        Volume memory v = volumes[id];
-        if (v.owner == address(0)) return (false, address(0), 0, 0);
-        // Volume-level expiry: owner-configured end of life.
-        if (v.ttlExpiry != 0 && block.number >= v.ttlExpiry) return (false, address(0), 0, 0);
-        if (price == 0) return (false, address(0), 0, 0);
-
-        (address owner_, uint8 depth,,, uint256 normBal,) = stamp.batches(id);
-        if (owner_ == address(0)) return (false, address(0), 0, 0); // batch missing / reaped
-        if (normBal <= cto) return (false, address(0), 0, 0);       // batch-level expired
-
-        uint256 remainingPerChunk = normBal - cto;
-        uint256 target = uint256(price) * uint256(v.graceBlocks);
-        if (remainingPerChunk >= target) return (false, address(0), 0, 0);
-
-        // Precise idempotent top-up: bring remaining back to exactly `target`.
-        perChunk = target - remainingPerChunk;
-        total = perChunk << depth;
-
-        Account memory a = accounts[v.owner];
-        if (!a.active) return (false, address(0), 0, 0);
-        payer = a.payer;
-
-        if (!bzz.transferFrom(payer, address(this), total)) revert TransferFromFailed();
-        stamp.topUp(id, perChunk);
-        toppedUp = true;
-    }
-
-    // ------------------------------------------------------------------
-    // Pruning
-    // ------------------------------------------------------------------
-
-    /// @notice True iff this volume is permanently un-keepable:
-    /// - its own ttlExpiry has passed, OR
-    /// - PostageStamp no longer knows about the batch (never created
-    ///   or reaped by `expireLimited`).
-    function isDead(bytes32 id) external view returns (bool) {
-        Volume memory v = volumes[id];
-        if (v.owner == address(0)) return false;
-        if (v.ttlExpiry != 0 && block.number >= v.ttlExpiry) return true;
-        (address owner_,,,,,) = stamp.batches(id);
-        return owner_ == address(0);
-    }
-
-    /// @notice Prune one dead volume. Reverts on NotExists / NotDead
-    /// so the caller can react.
-    function pruneOne(bytes32 id) external nonReentrant {
-        this._pruneOne(id);
-        emit Pruned(id, msg.sender);
-    }
-
-    /// @notice Bulk prune. Per-id failures are caught and emitted as
-    /// `PruneSkipped` with the revert selector embedded.
-    function pruneDead(bytes32[] calldata ids) external nonReentrant {
-        for (uint256 i = 0; i < ids.length; ++i) {
-            try this._pruneOne(ids[i]) {
-                emit Pruned(ids[i], msg.sender);
-            } catch (bytes memory err) {
-                emit PruneSkipped(ids[i], err);
-            }
+        uint256 n = _activeVolumeIds.length;
+        if (offset >= n) return new VolumeView[](0);
+        uint256 end = offset + limit;
+        if (end > n) end = n;
+        uint256 len = end - offset;
+        out = new VolumeView[](len);
+        for (uint256 i = 0; i < len; ++i) {
+            bytes32 id = _activeVolumeIds[offset + i];
+            Volume storage v = _volumes[id];
+            Account storage acct = _accounts[v.owner];
+            out[i] = VolumeView({
+                volumeId: id,
+                owner: v.owner,
+                payer: acct.payer,
+                chunkSigner: v.chunkSigner,
+                createdAt: v.createdAt,
+                ttlExpiry: v.ttlExpiry,
+                depth: v.depth,
+                status: v.status,
+                accountActive: acct.active
+            });
         }
     }
 
-    function _pruneOne(bytes32 id) external {
-        if (msg.sender != address(this)) revert OnlySelf();
-        Volume memory v = volumes[id];
-        if (v.owner == address(0)) revert NotExists();
+    // =====================================================================
+    // Internals
+    // =====================================================================
 
-        bool volumeExpired = v.ttlExpiry != 0 && block.number >= v.ttlExpiry;
-        (address owner_,,,,,) = stamp.batches(id);
-        bool batchGone = owner_ == address(0);
-        if (!volumeExpired && !batchGone) revert NotDead();
+    function _retire(bytes32 volumeId, uint8 reason) internal {
+        Volume storage v = _volumes[volumeId];
+        v.status = STATUS_RETIRED;
 
-        _remove(id);
-    }
-
-    // ------------------------------------------------------------------
-    // Internal: index maintenance (swap-and-pop)
-    // ------------------------------------------------------------------
-
-    function _remove(bytes32 id) internal {
-        uint256 idx = _indexPlusOne[id] - 1;
-        uint256 last = batchIds.length - 1;
-        if (idx != last) {
-            bytes32 lastId = batchIds[last];
-            batchIds[idx] = lastId;
-            _indexPlusOne[lastId] = idx + 1;
+        // swap-and-pop active list
+        uint32 idx = v.activeIndex;
+        uint256 last = _activeVolumeIds.length - 1;
+        if (uint256(idx) != last) {
+            bytes32 lastId = _activeVolumeIds[last];
+            _activeVolumeIds[idx] = lastId;
+            _volumes[lastId].activeIndex = idx;
         }
-        batchIds.pop();
-        delete _indexPlusOne[id];
-        delete volumes[id];
-    }
+        _activeVolumeIds.pop();
+        v.activeIndex = 0;
 
-    // ------------------------------------------------------------------
-    // Views
-    // ------------------------------------------------------------------
-
-    function volumeCount() external view returns (uint256) {
-        return batchIds.length;
-    }
-
-    /// @notice True iff `keepalive()` would top up this volume in the
-    /// current block (batch alive, volume not expired, active account,
-    /// remaining below target).
-    function isDue(bytes32 id) external view returns (bool) {
-        Volume memory v = volumes[id];
-        if (v.owner == address(0)) return false;
-        if (v.ttlExpiry != 0 && block.number >= v.ttlExpiry) return false;
-        if (!accounts[v.owner].active) return false;
-        uint64 price = stamp.lastPrice();
-        if (price == 0) return false;
-        (address owner_,,,, uint256 normBal,) = stamp.batches(id);
-        if (owner_ == address(0)) return false;
-        uint256 cto = stamp.currentTotalOutPayment();
-        if (normBal <= cto) return false;
-        return (normBal - cto) < uint256(price) * uint256(v.graceBlocks);
-    }
-
-    /// @notice Target balance (per-chunk and total) that a successful
-    /// top-up would leave the batch at. Useful for off-chain budgeting.
-    function estimatedTopUp(bytes32 id) external view returns (uint256 perChunk, uint256 total) {
-        Volume memory v = volumes[id];
-        if (v.owner == address(0)) return (0, 0);
-        uint64 price = stamp.lastPrice();
-        (, uint8 depth,,, uint256 normBal,) = stamp.batches(id);
-        uint256 cto = stamp.currentTotalOutPayment();
-        uint256 target = uint256(price) * uint256(v.graceBlocks);
-        uint256 remainingPerChunk = normBal > cto ? normBal - cto : 0;
-        if (remainingPerChunk >= target) return (0, 0);
-        perChunk = target - remainingPerChunk;
-        total = perChunk << depth;
+        emit VolumeRetired(volumeId, reason);
     }
 }

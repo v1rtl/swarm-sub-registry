@@ -2,7 +2,7 @@
   "name": "gas-boy",
   "version": "0.1.0",
   "private": true,
-  "description": "Cron-based Cloudflare Worker that calls SubscriptionRegistry.keepalive()",
+  "description": "Cron-based Cloudflare Worker that calls VolumeRegistry.trigger()",
   "scripts": {
     "dev": "./scripts/start-dev.sh",
     "deploy": "wrangler deploy",

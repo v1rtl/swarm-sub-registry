@@ -1,4 +1,4 @@
-import { runKeepalive, type Env } from "./registry";
+import { runCycle, type Env } from "./registry";
 
 export default {
   async scheduled(
@@ -10,7 +10,7 @@ export default {
     // finishes, but never throw — throwing out of scheduled() causes
     // retries and alarm storms.
     const task = (async () => {
-      const result = await runKeepalive(env);
+      const result = await runCycle(env);
       console.log(
         JSON.stringify({
           kind: "gas-boy/scheduled",
@@ -30,7 +30,7 @@ export default {
       return new Response("gas-boy ok\n", { status: 200 });
     }
     return new Response(
-      "gas-boy — endpoint: /health (keepalive + pruneDead run on cron)\n",
+      "gas-boy — endpoint: /health (trigger runs on cron)\n",
       { status: 200 },
     );
   },

@@ -2,11 +2,23 @@
 # Deploy VolumeRegistry to the orion anvil devnet.
 #
 # Reads:
-#   orion/state/chain.json       (rpc, deployer_key)
+#   orion/state/chain.json       (rpc, deployer_key, deployer_addr, chain_id)
 #   orion/state/deployment.json  (Token, PostageStamp addresses)
 #
 # Writes:
-#   orion/state/registry.json    ({address, chain_id, rpc, deployer, bzz, postage_stamp})
+#   orion/state/registry.json    ({address, chain_id, rpc, deployer, bzz,
+#                                  postage_stamp, grace_blocks})
+#
+# Sequence:
+#   1. Lower PostageStamp.minimumValidityBlocks from 17280 → 100 via
+#      anvil_setStorageAt so tests with small graceBlocks can deploy the
+#      registry (DESIGN §10 requires graceBlocks ≥ minimumValidityBlocks).
+#      Slot 9 packs [lastPrice(uint64 @ offset 0),
+#                    minimumValidityBlocks(uint64 @ offset 8),
+#                    lastUpdatedBlock(uint64 @ offset 16)].
+#   2. Deploy VolumeRegistry(postage, bzz, graceBlocks=200) via forge
+#      script.
+#   3. Write registry.json for pytest / gas-boy consumption.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,9 +26,15 @@ CHAIN_JSON="$REPO_ROOT/orion/state/chain.json"
 DEPLOY_JSON="$REPO_ROOT/orion/state/deployment.json"
 REGISTRY_JSON="$REPO_ROOT/orion/state/registry.json"
 
+# graceBlocks for the L3 devnet registry. Must be ≥ lowered
+# minimumValidityBlocks (100). Small so L3 time-based tests complete
+# quickly, per TEST-PLAN §2.1.
+GRACE_BLOCKS="${GRACE_BLOCKS:-200}"
+MIN_VALIDITY_BLOCKS="${MIN_VALIDITY_BLOCKS:-100}"
+
 command -v jq    >/dev/null || { echo "jq required" >&2; exit 1; }
 command -v forge >/dev/null || { echo "forge required" >&2; exit 1; }
-command -v cast  >/dev/null || { echo "cast required"  >&2; exit 1; }
+command -v cast  >/dev/null || { echo "cast required" >&2; exit 1; }
 
 [[ -f "$CHAIN_JSON"  ]] || { echo "missing $CHAIN_JSON — run 'uv run orion up --profile swarm' first" >&2; exit 1; }
 [[ -f "$DEPLOY_JSON" ]] || { echo "missing $DEPLOY_JSON — run 'uv run orion deploy --profile swarm' first" >&2; exit 1; }
@@ -33,19 +51,41 @@ echo "orion chain_id:    $CHAIN_ID"
 echo "BZZ token:         $BZZ"
 echo "PostageStamp:      $POSTAGE_STAMP"
 echo "Deployer:          $DEPLOYER_ADDR"
+echo "graceBlocks:       $GRACE_BLOCKS"
+echo "minValidityBlocks: $MIN_VALIDITY_BLOCKS (lowered from 17280)"
 echo
 
+# --- 1. Lower PostageStamp.minimumValidityBlocks via anvil_setStorageAt ---
+# Read current slot 9, preserve lastPrice (offset 0) and lastUpdatedBlock
+# (offset 16), overwrite minimumValidityBlocks (offset 8) with the target.
+SLOT9_RAW="$(cast storage "$POSTAGE_STAMP" 9 --rpc-url "$RPC")"
+# cast storage returns 0x-prefixed 32-byte hex, big-endian.
+SLOT9_VAL=$(python3 -c "
+v = int('$SLOT9_RAW', 16)
+mask64 = (1 << 64) - 1
+# Strip existing minimumValidityBlocks (bits 64..127).
+v &= ~(mask64 << 64)
+v |= ($MIN_VALIDITY_BLOCKS) << 64
+print('0x' + v.to_bytes(32, 'big').hex())
+")
+
+curl -s -X POST "$RPC" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"anvil_setStorageAt\",\"params\":[\"$POSTAGE_STAMP\",\"0x9\",\"$SLOT9_VAL\"],\"id\":1}" > /dev/null
+
+NEW_MIN="$(cast call "$POSTAGE_STAMP" 'minimumValidityBlocks()(uint64)' --rpc-url "$RPC")"
+echo "PostageStamp.minimumValidityBlocks() = $NEW_MIN"
+[[ "$NEW_MIN" == "$MIN_VALIDITY_BLOCKS" ]] || { echo "minValidityBlocks override failed" >&2; exit 1; }
+
+# --- 2. Deploy VolumeRegistry ---
 cd "$REPO_ROOT/contracts"
 
-# `forge script --broadcast` + `--json` emits the run metadata we need.
-# We capture the returns by parsing broadcast/run-latest.json.
 BZZ="$BZZ" POSTAGE_STAMP="$POSTAGE_STAMP" PRIVATE_KEY="$DEPLOYER_KEY" \
+  GRACE_BLOCKS="$GRACE_BLOCKS" \
   forge script script/DeployVolumeRegistry.s.sol:DeployVolumeRegistry \
     --rpc-url "$RPC" \
     --broadcast \
     --silent
 
-# The registry is the single CREATE tx in the latest broadcast for this chain.
 BROADCAST="$REPO_ROOT/contracts/broadcast/DeployVolumeRegistry.s.sol/$CHAIN_ID/run-latest.json"
 [[ -f "$BROADCAST" ]] || { echo "broadcast file not found at $BROADCAST" >&2; exit 1; }
 
@@ -55,10 +95,10 @@ if [[ -z "$REGISTRY_ADDR" || "$REGISTRY_ADDR" == "null" ]]; then
   exit 1
 fi
 
-# Sanity: contract has code at that address.
 CODE="$(cast code "$REGISTRY_ADDR" --rpc-url "$RPC")"
 [[ ${#CODE} -gt 2 ]] || { echo "no code at $REGISTRY_ADDR" >&2; exit 1; }
 
+# --- 3. Write state ---
 mkdir -p "$(dirname "$REGISTRY_JSON")"
 jq -n \
   --arg address "$REGISTRY_ADDR" \
@@ -67,7 +107,14 @@ jq -n \
   --arg deployer "$DEPLOYER_ADDR" \
   --arg bzz "$BZZ" \
   --arg postage_stamp "$POSTAGE_STAMP" \
-  '{address:$address, chain_id:($chain_id|tonumber), rpc:$rpc, deployer:$deployer, bzz:$bzz, postage_stamp:$postage_stamp}' \
+  --arg grace_blocks "$GRACE_BLOCKS" \
+  '{address:$address,
+    chain_id:($chain_id|tonumber),
+    rpc:$rpc,
+    deployer:$deployer,
+    bzz:$bzz,
+    postage_stamp:$postage_stamp,
+    grace_blocks:($grace_blocks|tonumber)}' \
   > "$REGISTRY_JSON"
 
 echo
