@@ -1,0 +1,19 @@
+{
+  "name": "tg-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telegram bot that monitors VolumeRegistry volumes and BZZ balances",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "./scripts/start-dev.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/bun": "^1.2.0"
+  }
+}
