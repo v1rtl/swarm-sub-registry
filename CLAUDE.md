@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Status note (2026-04-23).** The authoritative architecture is `notes/DESIGN.md`. The Solidity code currently in `contracts/src/` (`SubscriptionRegistry`, `VolumeRegistry`) and the description of it in the *Architecture → VolumeRegistry contract* section below is **scratch / prototype work** predating the design freeze — not a shipped prior version. Expect substantial rewrite or replacement during implementation. Where this file and `notes/DESIGN.md` disagree (e.g. three-role model vs owner/payer split, `designatePayer`/`confirmAccount` vs `designateFundingWallet`/`confirmAuth`, `keepalive` vs `trigger`, `initialDepth`/`graceBlocks` stored per-volume vs global immutable `graceBlocks`), `notes/DESIGN.md` wins. The `orion/` and `gas-boy/` sections describe support infrastructure that is expected to survive largely intact.
+
 ## Project Overview
 
 **swarm-sub-registry** is a multi-component Ethereum/Swarm infrastructure project:
