@@ -2,25 +2,32 @@
 # Render a chart of postage batch remaining balance over time, for every
 # volume registered in a VolumeRegistry.
 #
-# Reconstruction is event-driven — the script issues a handful of
-# `eth_getLogs` calls (bloom-filter-friendly on the RPC side) and rebuilds
-# each batch's per-chunk remaining balance analytically:
+# Two acquisition modes:
 #
-#   remaining(b) = last_seen_normalisedBalance  −  currentTotalOutPayment(b)
+#   --mode analytical (default)
+#     Event-driven reconstruction via eth_getLogs (bloom-filter-friendly).
+#     Each batch's per-chunk remaining balance is computed analytically:
 #
-# where `currentTotalOutPayment(b)` is computed from the `PriceUpdate` event
-# trajectory (piecewise-linear between price knots), and
-# `last_seen_normalisedBalance` is the latest `Toppedup` event's
-# newNormalisedBalance (or `BatchCreated`'s initial balance before any topup,
-# or a one-shot `eth_call batches(id)` for volumes alive at FROM_BLOCK).
+#       remaining(b) = last_seen_normalisedBalance − currentTotalOutPayment(b)
+#
+#     where `currentTotalOutPayment(b)` comes from the `PriceUpdate` event
+#     trajectory (piecewise-linear between price knots) and
+#     `last_seen_normalisedBalance` is the latest `Toppedup`/`BatchCreated`
+#     event. RPC cost is O(log_chunks) — independent of chart resolution.
+#     Reflects the protocol-level virtual-time accounting.
+#
+#   --mode actual
+#     Per-sample `eth_call` to `PostageStamp.batches(id)` and
+#     `PostageStamp.currentTotalOutPayment()` at each chart sample block.
+#     Reflects the on-chain READ of those view functions, so a batch
+#     that has been pruned (owner=0) reports 0 — whereas analytical
+#     mode would still compute a positive pre-prune remaining until
+#     cto catches up. Useful for visual parity with the chain's own
+#     view. RPC cost is O(N_volumes × N_samples) — expensive.
 #
 # Between topups the curve drains linearly at `lastPrice` per block; at each
 # `Toppedup` log the line jumps up. Retirement (`VolumeRetired`) cuts the
 # series to NaN; matplotlib breaks the line there, matching TEST-PLAN §6.4.
-#
-# Total RPC roundtrips are O(log_chunks) + a couple of `eth_call`s at the
-# window boundary — independent of the number of chart samples, and nearly
-# independent of volume count.
 #
 # Usage:
 #   ./scripts/plot-batch-balances.sh [flags] FROM_BLOCK [TO_BLOCK]
@@ -38,6 +45,7 @@
 #   --rpc-url URL       chain RPC (archive needed for eth_call on FROM_BLOCK)
 #   --registry ADDR     VolumeRegistry address
 #   --postage ADDR      PostageStamp address
+#   --mode M            analytical | actual                (default analytical)
 #   --step N            chart resolution in blocks between samples (default 50)
 #   --metric M          remaining | total | normalised    (default remaining)
 #   --render R          png | svg | ascii                 (default png)
@@ -66,6 +74,7 @@ RENDER="png"
 OUTFILE="batch-balances.png"
 TSV="batch-balances.tsv"
 LOG_CHUNK=5000
+MODE="analytical"
 
 # Connection params: flags override env; env provides defaults.
 RPC_URL="${RPC_URL-}"
@@ -77,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --rpc-url) RPC_URL="$2"; shift 2;;
     --registry) REGISTRY="$2"; shift 2;;
     --postage) POSTAGE="$2"; shift 2;;
+    --mode) MODE="$2"; shift 2;;
     --step) STEP="$2"; shift 2;;
     --metric) METRIC="$2"; shift 2;;
     --render) RENDER="$2"; shift 2;;
@@ -97,6 +107,8 @@ case "$METRIC" in remaining|total|normalised) ;;
   *) echo "invalid --metric: $METRIC" >&2; exit 2;; esac
 case "$RENDER" in png|svg|ascii) ;;
   *) echo "invalid --render: $RENDER" >&2; exit 2;; esac
+case "$MODE" in analytical|actual) ;;
+  *) echo "invalid --mode: $MODE (want analytical|actual)" >&2; exit 2;; esac
 
 if [[ -z "$RPC_URL" ]]; then
   echo "missing RPC_URL (--rpc-url flag or env var)" >&2; exit 2;
@@ -131,7 +143,7 @@ for bin in uv python3; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing tool: $bin" >&2; exit 1; }
 done
 
-export RPC_URL REGISTRY POSTAGE FROM_BLOCK TO_BLOCK STEP METRIC RENDER OUTFILE TSV LOG_CHUNK
+export RPC_URL REGISTRY POSTAGE FROM_BLOCK TO_BLOCK STEP METRIC RENDER OUTFILE TSV LOG_CHUNK MODE
 
 # ---------------------------------------------------------------------------
 # Work lives in Python — matplotlib for rendering, pycryptodome for keccak
@@ -168,6 +180,7 @@ RENDER = os.environ["RENDER"]
 OUTFILE = os.environ["OUTFILE"]
 TSV = os.environ["TSV"]
 LOG_CHUNK = int(os.environ["LOG_CHUNK"])
+MODE = os.environ["MODE"]  # "analytical" or "actual"
 
 # --------------------------- JSON-RPC ---------------------------------------
 
@@ -284,7 +297,7 @@ if FROM_BLOCK >= TO_BLOCK:
 print(
     f"[plot] RPC={RPC}\n"
     f"[plot] range={FROM_BLOCK}..{TO_BLOCK}  step={STEP}  "
-    f"metric={METRIC}  render={RENDER}",
+    f"metric={METRIC}  render={RENDER}  mode={MODE}",
     file=sys.stderr,
 )
 
@@ -389,69 +402,75 @@ if not volumes:
     print("[plot] no volumes to chart — done", file=sys.stderr)
     sys.exit(0)
 
-# --------------------------- phase 2: seed initial nb -----------------------
+# --------------------------- phase 2: seed initial nb (analytical only) -----
 
 vids = sorted(volumes.keys())
 
-# (a) For window-created volumes: read their initial nb from BatchCreated
-#     logs on PostageStamp. Filter by topic1 ∈ {vid, …} in chunks.
-print("[plot] fetching BatchCreated logs for window-created volumes...", file=sys.stderr)
-CREATED_IN_WINDOW = [vid for vid in vids if vid in {l["topics"][1] for l in vc_logs}]
-BATCH_CHUNK = 100
-for i in range(0, len(CREATED_IN_WINDOW), BATCH_CHUNK):
-    chunk_ids = CREATED_IN_WINDOW[i : i + BATCH_CHUNK]
-    bc_logs = get_logs_paged(
-        POSTAGE, [TOPIC_BATCH_CREATED, chunk_ids], FROM_BLOCK, TO_BLOCK
+if MODE == "analytical":
+    # (a) For window-created volumes: read their initial nb from BatchCreated
+    #     logs on PostageStamp. Filter by topic1 ∈ {vid, …} in chunks.
+    print(
+        "[plot] fetching BatchCreated logs for window-created volumes...",
+        file=sys.stderr,
     )
-    for log in bc_logs:
+    CREATED_IN_WINDOW = [vid for vid in vids if vid in {l["topics"][1] for l in vc_logs}]
+    BATCH_CHUNK = 100
+    for i in range(0, len(CREATED_IN_WINDOW), BATCH_CHUNK):
+        chunk_ids = CREATED_IN_WINDOW[i : i + BATCH_CHUNK]
+        bc_logs = get_logs_paged(
+            POSTAGE, [TOPIC_BATCH_CREATED, chunk_ids], FROM_BLOCK, TO_BLOCK
+        )
+        for log in bc_logs:
+            vid = log["topics"][1]
+            if vid not in volumes:
+                continue
+            block = hex_int(log["blockNumber"])
+            # data: totalAmount(32) + normalisedBalance(32) + owner(32) + depth(32) + bucketDepth(32) + immutableFlag(32)
+            data = bytes.fromhex(log["data"][2:])
+            nb = int.from_bytes(data[32:64], "big")
+            volumes[vid]["nb_events"].append((block, nb))
+
+    # (b) For pre-existing volumes: one eth_call batches(id) at FROM_BLOCK.
+    PRE_EXISTING_IDS = [vid for vid, _ in pre_existing]
+    if PRE_EXISTING_IDS:
+        print(
+            f"[plot] seeding {len(PRE_EXISTING_IDS)} pre-existing nb via eth_call...",
+            file=sys.stderr,
+        )
+    for vid in PRE_EXISTING_IDS:
+        if vid not in volumes:
+            continue
+        # batches(bytes32) returns (address, uint8, uint8, bool, uint256, uint256)
+        # packed into 6 * 32-byte words.
+        data = SEL_BATCHES + encode_bytes32(vid)
+        try:
+            raw = eth_call(POSTAGE, data, FROM_BLOCK)
+        except RuntimeError:
+            continue
+        buf = bytes.fromhex(raw[2:])
+        if len(buf) < 5 * 32:
+            continue
+        nb = int.from_bytes(buf[4 * 32 : 5 * 32], "big")
+        if nb > 0:
+            volumes[vid]["nb_events"].append((FROM_BLOCK, nb))
+
+# --------------------------- phase 3: retirement + (analytical-only) topups -
+
+if MODE == "analytical":
+    print("[plot] fetching Toppedup logs...", file=sys.stderr)
+    tu_logs = get_logs_paged(REGISTRY, [TOPIC_TOPPEDUP], FROM_BLOCK, TO_BLOCK)
+    for log in tu_logs:
         vid = log["topics"][1]
         if vid not in volumes:
             continue
         block = hex_int(log["blockNumber"])
-        # data: totalAmount(32) + normalisedBalance(32) + owner(32) + depth(32) + bucketDepth(32) + immutableFlag(32)
+        # data: amount(32) + newNormalisedBalance(32)
         data = bytes.fromhex(log["data"][2:])
-        nb = int.from_bytes(data[32:64], "big")
-        volumes[vid]["nb_events"].append((block, nb))
+        new_nb = int.from_bytes(data[32:64], "big")
+        volumes[vid]["nb_events"].append((block, new_nb))
+    print(f"[plot]   Toppedup events: {len(tu_logs)}", file=sys.stderr)
 
-# (b) For pre-existing volumes: one eth_call batches(id) at FROM_BLOCK.
-PRE_EXISTING_IDS = [vid for vid, _ in pre_existing]
-if PRE_EXISTING_IDS:
-    print(
-        f"[plot] seeding {len(PRE_EXISTING_IDS)} pre-existing nb via eth_call...",
-        file=sys.stderr,
-    )
-for vid in PRE_EXISTING_IDS:
-    if vid not in volumes:
-        continue
-    # batches(bytes32) returns (address, uint8, uint8, bool, uint256, uint256)
-    # packed into 6 * 32-byte words.
-    data = SEL_BATCHES + encode_bytes32(vid)
-    try:
-        raw = eth_call(POSTAGE, data, FROM_BLOCK)
-    except RuntimeError:
-        continue
-    buf = bytes.fromhex(raw[2:])
-    if len(buf) < 5 * 32:
-        continue
-    nb = int.from_bytes(buf[4 * 32 : 5 * 32], "big")
-    if nb > 0:
-        volumes[vid]["nb_events"].append((FROM_BLOCK, nb))
-
-# --------------------------- phase 3: topups + retires ----------------------
-
-print("[plot] fetching Toppedup logs...", file=sys.stderr)
-tu_logs = get_logs_paged(REGISTRY, [TOPIC_TOPPEDUP], FROM_BLOCK, TO_BLOCK)
-for log in tu_logs:
-    vid = log["topics"][1]
-    if vid not in volumes:
-        continue
-    block = hex_int(log["blockNumber"])
-    # data: amount(32) + newNormalisedBalance(32)
-    data = bytes.fromhex(log["data"][2:])
-    new_nb = int.from_bytes(data[32:64], "big")
-    volumes[vid]["nb_events"].append((block, new_nb))
-print(f"[plot]   Toppedup events: {len(tu_logs)}", file=sys.stderr)
-
+# VolumeRetired is needed in both modes — it cuts the chart series to NaN.
 print("[plot] fetching VolumeRetired logs...", file=sys.stderr)
 vr_logs = get_logs_paged(REGISTRY, [TOPIC_VOLUME_RETIRED], FROM_BLOCK, TO_BLOCK)
 for log in vr_logs:
@@ -462,56 +481,61 @@ for log in vr_logs:
     volumes[vid]["retire_block"] = block
 print(f"[plot]   VolumeRetired events: {len(vr_logs)}", file=sys.stderr)
 
-# Sort nb_events per volume.
-for v in volumes.values():
-    v["nb_events"].sort()
+if MODE == "analytical":
+    # Sort nb_events per volume.
+    for v in volumes.values():
+        v["nb_events"].sort()
 
-# --------------------------- phase 4: price trajectory ----------------------
+# --------------------------- phase 4: price trajectory (analytical only) ----
 
-print("[plot] fetching PriceUpdate logs + initial cto/lastPrice...", file=sys.stderr)
-pu_logs = get_logs_paged(POSTAGE, [TOPIC_PRICE_UPDATE], FROM_BLOCK, TO_BLOCK)
-cto_0 = hex_int(eth_call(POSTAGE, SEL_CTO, FROM_BLOCK))
-last_price_0 = hex_int(eth_call(POSTAGE, SEL_LAST_PRICE, FROM_BLOCK))
+if MODE == "analytical":
+    print("[plot] fetching PriceUpdate logs + initial cto/lastPrice...", file=sys.stderr)
+    pu_logs = get_logs_paged(POSTAGE, [TOPIC_PRICE_UPDATE], FROM_BLOCK, TO_BLOCK)
+    cto_0 = hex_int(eth_call(POSTAGE, SEL_CTO, FROM_BLOCK))
+    last_price_0 = hex_int(eth_call(POSTAGE, SEL_LAST_PRICE, FROM_BLOCK))
 
-# Piecewise-linear cto(b): list of (knot_block, cto_at_knot, price_from_here).
-# At FROM_BLOCK the price-in-force is last_price_0. PriceUpdate events turn
-# the piecewise function into a new segment.
-knots = [(FROM_BLOCK, cto_0, last_price_0)]
-for log in sorted(pu_logs, key=lambda l: (hex_int(l["blockNumber"]), hex_int(l["logIndex"]))):
-    block = hex_int(log["blockNumber"])
-    if block < FROM_BLOCK:
-        continue
-    # PriceUpdate(uint256) — data is a single uint256 word.
-    new_price = hex_int(log["data"])
-    prev_block, prev_cto, prev_price = knots[-1]
-    cto_at = prev_cto + prev_price * (block - prev_block)
-    # If this is the same block as the last knot (edge case: anvil mining
-    # multiple setPrices in one block), overwrite rather than append.
-    if prev_block == block:
-        knots[-1] = (block, cto_at, new_price)
-    else:
-        knots.append((block, cto_at, new_price))
-print(f"[plot]   PriceUpdate events: {len(pu_logs)}  knots: {len(knots)}", file=sys.stderr)
+    # Piecewise-linear cto(b): list of (knot_block, cto_at_knot, price_from_here).
+    # At FROM_BLOCK the price-in-force is last_price_0. PriceUpdate events turn
+    # the piecewise function into a new segment.
+    knots = [(FROM_BLOCK, cto_0, last_price_0)]
+    for log in sorted(
+        pu_logs, key=lambda l: (hex_int(l["blockNumber"]), hex_int(l["logIndex"]))
+    ):
+        block = hex_int(log["blockNumber"])
+        if block < FROM_BLOCK:
+            continue
+        # PriceUpdate(uint256) — data is a single uint256 word.
+        new_price = hex_int(log["data"])
+        prev_block, prev_cto, prev_price = knots[-1]
+        cto_at_knot = prev_cto + prev_price * (block - prev_block)
+        # If this is the same block as the last knot (edge case: anvil mining
+        # multiple setPrices in one block), overwrite rather than append.
+        if prev_block == block:
+            knots[-1] = (block, cto_at_knot, new_price)
+        else:
+            knots.append((block, cto_at_knot, new_price))
+    print(
+        f"[plot]   PriceUpdate events: {len(pu_logs)}  knots: {len(knots)}",
+        file=sys.stderr,
+    )
 
+    def cto_at(b: int) -> int:
+        ks = [k[0] for k in knots]
+        i = bisect.bisect_right(ks, b) - 1
+        if i < 0:
+            i = 0
+        kb, kcto, kprice = knots[i]
+        return kcto + kprice * (b - kb)
 
-def cto_at(b: int) -> int:
-    ks = [k[0] for k in knots]
-    i = bisect.bisect_right(ks, b) - 1
-    if i < 0:
-        i = 0
-    kb, kcto, kprice = knots[i]
-    return kcto + kprice * (b - kb)
-
-
-def last_nb_at(vid: str, b: int):
-    events = volumes[vid]["nb_events"]
-    if not events:
-        return None
-    ks = [e[0] for e in events]
-    i = bisect.bisect_right(ks, b) - 1
-    if i < 0:
-        return None
-    return events[i][1]
+    def last_nb_at(vid: str, b: int):
+        events = volumes[vid]["nb_events"]
+        if not events:
+            return None
+        ks = [e[0] for e in events]
+        i = bisect.bisect_right(ks, b) - 1
+        if i < 0:
+            return None
+        return events[i][1]
 
 
 # --------------------------- phase 5: sample + write TSV --------------------
@@ -521,7 +545,7 @@ if sample_blocks[-1] != TO_BLOCK:
     sample_blocks.append(TO_BLOCK)
 
 
-def value_for(vid: str, b: int):
+def value_analytical(vid: str, b: int):
     v = volumes[vid]
     if b < v["create_block"]:
         return None
@@ -542,15 +566,72 @@ def value_for(vid: str, b: int):
     return None
 
 
-print(f"[plot] writing {len(sample_blocks)} samples to {TSV}...", file=sys.stderr)
+def value_actual(vid: str, b: int, cto_b: int):
+    """Read the batch struct live from PostageStamp at block b. Returns
+    None if the batch doesn't exist (pruned), is dead, or the volume is
+    outside its active window.
+    """
+    v = volumes[vid]
+    if b < v["create_block"]:
+        return None
+    if v["retire_block"] is not None and b >= v["retire_block"]:
+        return None
+    try:
+        raw = eth_call(POSTAGE, SEL_BATCHES + encode_bytes32(vid), b)
+    except RuntimeError:
+        return None
+    buf = bytes.fromhex(raw[2:])
+    if len(buf) < 5 * 32:
+        return None
+    # slot 0: packed [owner(20), depth(1), bucketDepth(1), immutable(1), padding].
+    # ABI-encodes as word 0 = address (right-padded? actually left-padded to 32).
+    # On return the struct is 6 * 32-byte words, one field per word.
+    owner_word = buf[0:32]
+    # address padded to 32 bytes, left-zeroed.
+    if owner_word == b"\x00" * 32:
+        return None  # pruned
+    nb = int.from_bytes(buf[4 * 32 : 5 * 32], "big")
+    rem = nb - cto_b
+    if rem <= 0:
+        return None
+    if METRIC == "remaining":
+        return rem
+    if METRIC == "total":
+        return rem << v["depth"]
+    if METRIC == "normalised":
+        return nb
+    return None
+
+
+print(
+    f"[plot] writing {len(sample_blocks)} samples to {TSV} (mode={MODE})...",
+    file=sys.stderr,
+)
 with open(TSV, "w") as f:
     header = ["block", "cto"] + vids
     f.write("\t".join(header) + "\n")
-    for b in sample_blocks:
-        row = [str(b), str(cto_at(b))]
-        for vid in vids:
-            val = value_for(vid, b)
-            row.append("NaN" if val is None else str(val))
+    for sample_i, b in enumerate(sample_blocks):
+        if MODE == "analytical":
+            cto_b = cto_at(b)
+            row = [str(b), str(cto_b)]
+            for vid in vids:
+                val = value_analytical(vid, b)
+                row.append("NaN" if val is None else str(val))
+        else:  # actual
+            # Progress ticker for the expensive path.
+            if sample_i % 25 == 0 or sample_i == len(sample_blocks) - 1:
+                print(
+                    f"[plot]   actual sample {sample_i + 1}/{len(sample_blocks)}  block={b}",
+                    file=sys.stderr,
+                )
+            try:
+                cto_b = hex_int(eth_call(POSTAGE, SEL_CTO, b))
+            except RuntimeError:
+                cto_b = 0
+            row = [str(b), str(cto_b)]
+            for vid in vids:
+                val = value_actual(vid, b, cto_b)
+                row.append("NaN" if val is None else str(val))
         f.write("\t".join(row) + "\n")
 
 # --------------------------- phase 6: render --------------------------------
