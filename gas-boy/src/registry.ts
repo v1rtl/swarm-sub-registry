@@ -27,6 +27,7 @@ export interface RunResult {
   skipped?: string;
   activeCount?: number;
   dueCount?: number;
+  deadCount?: number;
   pagesRead?: number;
   txHash?: Hex;
   blockNumber?: string;
@@ -139,13 +140,18 @@ async function collectActiveVolumes(
  *   - PostageStamp reports a live batch (owner != 0 and not expired),
  *     AND the remaining per-chunk < target per-chunk.
  */
-async function filterDue(
+interface FilterResult {
+  due: VolumeView[];
+  dead: VolumeView[];
+}
+
+async function filterVolumes(
   client: PublicClient,
   postage: `0x${string}`,
   registry: `0x${string}`,
   volumes: VolumeView[],
-): Promise<VolumeView[]> {
-  if (volumes.length === 0) return [];
+): Promise<FilterResult> {
+  if (volumes.length === 0) return { due: [], dead: [] };
 
   // One multicall: [lastPrice, graceBlocks, currentTotalOutPayment, ...batches(id)]
   const base = [
@@ -186,9 +192,9 @@ async function filterDue(
   const target = lastPrice * graceBlocks;
 
   const due: VolumeView[] = [];
+  const dead: VolumeView[] = [];
   for (let i = 0; i < volumes.length; ++i) {
     const v = volumes[i]!;
-    if (!v.accountActive) continue;
     const batch = results[3 + i] as unknown as readonly [
       `0x${string}`,
       number,
@@ -200,14 +206,24 @@ async function filterDue(
     const batchOwner = batch[0];
     const batchDepth = batch[1];
     const normalisedBalance = batch[4];
-    if (batchOwner === "0x0000000000000000000000000000000000000000") continue;
-    if (batchDepth !== v.depth) continue; // retire edge, not a topup
-    if (normalisedBalance <= outpayment) continue; // dead
-    if (batchOwner.toLowerCase() !== v.chunkSigner.toLowerCase()) continue;
+
+    // Dead: batch missing, expired, depth/owner mismatch → trigger will retire.
+    const batchMissing = batchOwner === "0x0000000000000000000000000000000000000000";
+    const batchExpired = !batchMissing && normalisedBalance <= outpayment;
+    const depthMismatch = !batchMissing && batchDepth !== v.depth;
+    const ownerMismatch = !batchMissing && batchOwner.toLowerCase() !== v.chunkSigner.toLowerCase();
+
+    if (batchMissing || batchExpired || depthMismatch || ownerMismatch) {
+      dead.push(v);
+      continue;
+    }
+
+    // Due: needs topup (only if account is active, else trigger just emits skip).
+    if (!v.accountActive) continue;
     const remaining = normalisedBalance - outpayment;
     if (remaining < target) due.push(v);
   }
-  return due;
+  return { due, dead };
 }
 
 /**
@@ -248,7 +264,7 @@ export async function runCycle(env: Env): Promise<RunResult> {
   const registry = env.REGISTRY_ADDRESS;
   const postage = env.POSTAGE_ADDRESS;
 
-  let due: VolumeView[] = [];
+  let triggerIds: `0x${string}`[] = [];
   try {
     const { volumes, pages } = await collectActiveVolumes(
       publicClient,
@@ -262,8 +278,10 @@ export async function runCycle(env: Env): Promise<RunResult> {
       result.durationMs = duration();
       return result;
     }
-    due = await filterDue(publicClient, postage, registry, volumes);
+    const { due, dead } = await filterVolumes(publicClient, postage, registry, volumes);
     result.dueCount = due.length;
+    result.deadCount = dead.length;
+    triggerIds = [...due, ...dead].map((v) => v.volumeId);
   } catch (err) {
     result.ok = false;
     result.error = err instanceof Error ? err.message : String(err);
@@ -271,14 +289,14 @@ export async function runCycle(env: Env): Promise<RunResult> {
     return result;
   }
 
-  if (due.length === 0) {
-    result.skipped = "no due volumes";
+  if (triggerIds.length === 0) {
+    result.skipped = "no due or dead volumes";
     result.durationMs = duration();
     return result;
   }
 
   try {
-    const ids = due.map((v) => v.volumeId);
+    const ids = triggerIds;
     const { request } = await publicClient.simulateContract({
       address: registry,
       abi: registryAbi,
