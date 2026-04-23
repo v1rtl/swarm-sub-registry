@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Live tail: render two ASCII charts of VolumeRegistry state in the
+# Live tail: render two unicode charts of VolumeRegistry state in the
 # terminal, refreshed every new block.
 #
 #   1. Per-volume postage batch remaining balance (one subplot per
 #      active volume, rolling history window).
 #   2. Safe BZZ balance over the same history window.
 #
-# Both figures are produced via matplotlib with the `mpl_ascii` backend
-# and repainted over the same terminal area on each tick. The registry
-# is the source of truth: retired / pruned volumes vanish from the
-# chart on the next tick; newly created volumes appear as new rows.
+# Rendering is done with `plotext` (braille-dot terminal plots, built-in
+# subplots, `plt.build()` for string output). The output is written
+# inside the terminal's alternate screen buffer (vim/less pattern) so
+# the repaint stays in place and the pre-run terminal scrollback is
+# restored on exit. The registry is the source of truth: retired /
+# pruned volumes vanish from the chart on the next tick; newly created
+# volumes appear as new rows.
 #
 # No persistence. No event indexing. No archive requirements. Every
 # datapoint is a live `eth_call` at the current tip.
@@ -96,9 +99,8 @@ export RPC_URL REGISTRY SAFE POLL_INTERVAL HISTORY_N DURATION
 # ---------------------------------------------------------------------------
 
 exec uv run --quiet \
-  --with "matplotlib" --with "numpy" --with "mpl_ascii" \
+  --with "plotext" \
   python3 - <<'PY'
-import io
 import json
 import os
 import shutil
@@ -110,9 +112,7 @@ from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import matplotlib
-matplotlib.use("module://mpl_ascii")
-import matplotlib.pyplot as plt
+import plotext as plt
 
 # --------------------------- config -----------------------------------------
 
@@ -289,89 +289,113 @@ safe_hist: deque = deque(maxlen=HISTORY_N)
 
 def term_size():
     cols, rows = shutil.get_terminal_size(fallback=(140, 40))
-    return max(80, cols), max(20, rows)
+    return max(60, cols), max(20, rows)
 
 
-def figsize_for_rows(n_rows: int):
-    cols, rows = term_size()
-    # mpl_ascii maps ~10 chars/inch horizontally and ~5 rows/inch
-    # vertically. Reserve a few rows for the Safe chart + divider.
-    chart_budget_rows = max(8, rows - 14)
-    per_row = max(3, chart_budget_rows // max(1, n_rows))
-    return (cols / 10.0, (per_row * max(1, n_rows)) / 5.0)
+# Fixed budgets, in terminal rows, for the non-chart chrome we print each
+# frame: header lines, divider, padding. Everything else goes to the two
+# chart regions.
+HEADER_ROWS = 2  # one header line per chart + blank
+DIVIDER_ROWS = 1
+SAFE_ROWS_MIN = 10  # minimum rows for the Safe chart to be legible
 
 
-def figsize_safe():
-    cols, _ = term_size()
-    return (cols / 10.0, 8 / 5.0)
+def _step_points(xs, ys):
+    """Convert (x,y) point list into step-post representation by doubling
+    each transition. plotext has no built-in step plotting, so we
+    pre-process the data to draw horizontal-then-vertical line segments."""
+    if not xs:
+        return [], []
+    sx, sy = [], []
+    for i in range(len(xs) - 1):
+        sx.append(xs[i])
+        sy.append(ys[i])
+        sx.append(xs[i + 1])
+        sy.append(ys[i])  # hold value until next x
+    sx.append(xs[-1])
+    sy.append(ys[-1])
+    return sx, sy
 
 
-def render_batch_figure(block_number: int, utc_iso: str) -> str:
+def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> str:
     series = [(vid, list(batch_hist[vid])) for vid in batch_hist if batch_hist[vid]]
-    if not series:
-        return (
-            f"Postage batch balances — block {block_number} @ {utc_iso}\n"
-            "  (no active volumes)\n"
-        )
-    n = len(series)
-    fig, axes = plt.subplots(
-        nrows=n, ncols=1, figsize=figsize_for_rows(n), sharex=True, squeeze=False
+    header = (
+        f"Postage batch balances — block {block_number} @ {utc_iso} | "
+        f"{len(series)} active"
     )
-    axes = axes[:, 0]
+    if not series:
+        return header + "\n  (no active volumes)\n"
+
+    n = len(series)
+    cols, _ = term_size()
+    plt.clear_figure()
+    plt.subplots(n, 1)
     for i, (vid, points) in enumerate(series):
-        ax = axes[i]
+        plt.subplot(i + 1, 1)
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        ax.step(xs, ys, where="post")
-        ax.set_title(f"{vid[:18]}...", loc="left")
-        ax.set_ylabel("rem/chunk")
-    axes[-1].set_xlabel("block")
-    fig.suptitle(
-        f"Postage batches — block {block_number} @ {utc_iso} | {n} active"
-    )
-    fig.tight_layout()
-    # mpl_ascii's print_txt writes bytes, so we need BytesIO.
-    buf = io.BytesIO()
-    fig.savefig(buf, format="txt")
-    plt.close(fig)
-    return buf.getvalue().decode("utf-8")
+        sx, sy = _step_points(xs, ys)
+        plt.plot(sx, sy, marker="braille")
+        plt.title(f"{vid[:18]}...")
+        plt.ylabel("rem")
+    plt.plotsize(cols, max(n * 4, budget_rows))
+    body = plt.build()
+    return header + "\n" + body
 
 
-def render_safe_figure(block_number: int, utc_iso: str, safe_bal: int) -> str:
-    if not safe_hist:
-        return (
-            f"Safe BZZ balance — block {block_number} @ {utc_iso}\n"
-            "  (no samples yet)\n"
-        )
-    fig, ax = plt.subplots(figsize=figsize_safe())
-    xs = [p[0] for p in safe_hist]
-    ys = [p[1] / 1e16 for p in safe_hist]  # 16-decimal BZZ → whole-BZZ units
-    ax.step(xs, ys, where="post")
-    ax.set_xlabel("block")
-    ax.set_ylabel("BZZ")
-    fig.suptitle(
+def render_safe_figure(block_number: int, utc_iso: str, safe_bal: int, rows: int) -> str:
+    header = (
         f"Safe {SAFE[:8]}...{SAFE[-6:]} — block {block_number} @ {utc_iso} | "
         f"{safe_bal / 1e16:.6f} BZZ"
     )
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="txt")
-    plt.close(fig)
-    return buf.getvalue().decode("utf-8")
+    if not safe_hist:
+        return header + "\n  (no samples yet)\n"
+    cols, _ = term_size()
+    plt.clear_figure()
+    xs = [p[0] for p in safe_hist]
+    ys = [p[1] / 1e16 for p in safe_hist]
+    sx, sy = _step_points(xs, ys)
+    plt.plot(sx, sy, marker="braille")
+    plt.ylabel("BZZ")
+    plt.xlabel("block")
+    plt.plotsize(cols, rows)
+    body = plt.build()
+    return header + "\n" + body
+
+
+# Alternate-screen buffer: switches the terminal to a blank canvas on
+# entry and restores the pre-run scrollback on exit. vim/less/htop use
+# this. Critical for "repaint in place" — without it, content from each
+# frame can end up accumulating in scrollback despite screen-clears.
+ALT_SCREEN_ENTER = "\033[?1049h"
+ALT_SCREEN_EXIT = "\033[?1049l"
+CURSOR_HIDE = "\033[?25l"
+CURSOR_SHOW = "\033[?25h"
+# Home cursor + clear from cursor to end of screen. Order matters:
+# going H first then J means J wipes from (1,1) downward — always
+# clears the whole visible area regardless of where the cursor was.
+CLEAR_FRAME = "\033[H\033[J"
 
 
 def repaint(block_number: int, utc_iso: str, safe_bal: int):
+    cols, rows = term_size()
+    # Allocate vertical space: fixed safe region, remainder for batch.
+    safe_rows = SAFE_ROWS_MIN
+    batch_rows = max(6, rows - safe_rows - HEADER_ROWS * 2 - DIVIDER_ROWS)
+
+    batch_txt = render_batch_figure(block_number, utc_iso, batch_rows)
+    safe_txt = render_safe_figure(block_number, utc_iso, safe_bal, safe_rows)
+    divider = "─" * cols
+
+    out = []
     if IS_TTY:
-        # Clear + home cursor.
-        sys.stdout.write("\033[2J\033[H")
-    batch_txt = render_batch_figure(block_number, utc_iso)
-    safe_txt = render_safe_figure(block_number, utc_iso, safe_bal)
-    cols, _ = term_size()
-    divider = "─" * cols + "\n"
-    sys.stdout.write(batch_txt)
-    sys.stdout.write("\n")
-    sys.stdout.write(divider)
-    sys.stdout.write(safe_txt)
+        out.append(CLEAR_FRAME)
+    out.append(batch_txt.rstrip("\n"))
+    out.append("\n")
+    out.append(divider)
+    out.append("\n")
+    out.append(safe_txt.rstrip("\n"))
+    sys.stdout.write("".join(out))
     sys.stdout.flush()
 
 
@@ -406,6 +430,13 @@ signal.signal(signal.SIGTERM, _stop)
 started = time.time()
 last_block = -1
 last_safe_bal = None
+
+# Enter the alternate screen BEFORE the first frame so the user's
+# pre-run terminal content is preserved. Exit in finally — even on
+# uncaught exception the terminal must be restored.
+if IS_TTY:
+    sys.stdout.write(ALT_SCREEN_ENTER + CURSOR_HIDE)
+    sys.stdout.flush()
 
 try:
     while _running:
@@ -470,7 +501,9 @@ try:
         time.sleep(POLL_INTERVAL)
 finally:
     if IS_TTY:
-        sys.stdout.write("\033[2J\033[H")
+        # Restore cursor + leave alternate screen so the user's terminal
+        # looks exactly like it did before the run.
+        sys.stdout.write(CURSOR_SHOW + ALT_SCREEN_EXIT)
         sys.stdout.flush()
     msg_block = last_block if last_block >= 0 else "<none>"
     msg_safe = (
