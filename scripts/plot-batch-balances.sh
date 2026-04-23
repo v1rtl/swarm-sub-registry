@@ -25,19 +25,35 @@
 # Usage:
 #   ./scripts/plot-batch-balances.sh [flags] FROM_BLOCK [TO_BLOCK]
 #
-# Required env:
-#   RPC_URL   — chain RPC (archive for eth_call on FROM_BLOCK; non-archive
-#               is OK for log queries)
-#   REGISTRY  — VolumeRegistry address
-#   POSTAGE   — PostageStamp address
+# Connection to the chain is supplied in one of three ways (flags win over
+# env, env wins over implicit defaults):
+#
+#   a) flags:  --rpc-url URL --registry ADDR --postage ADDR
+#   b) env:    RPC_URL, REGISTRY, POSTAGE
+#
+# Both forms work under bash/zsh/fish. The flag form is the fish-friendly
+# path because fish does not accept inline `VAR=val command` syntax.
 #
 # Flags:
+#   --rpc-url URL       chain RPC (archive needed for eth_call on FROM_BLOCK)
+#   --registry ADDR     VolumeRegistry address
+#   --postage ADDR      PostageStamp address
 #   --step N            chart resolution in blocks between samples (default 50)
 #   --metric M          remaining | total | normalised    (default remaining)
 #   --render R          png | svg | ascii                 (default png)
 #   --out FILE          chart output path   (default batch-balances.png)
 #   --tsv FILE          data file path      (default batch-balances.tsv)
 #   --log-chunk N       eth_getLogs block span per request (default 5000)
+#
+# Examples (all three shells):
+#
+#   # bash/zsh, env form:
+#   RPC_URL=$RPC_URL REGISTRY=$REG POSTAGE=$PS \
+#     ./scripts/plot-batch-balances.sh 10715650
+#
+#   # fish, flag form:
+#   ./scripts/plot-batch-balances.sh \
+#     --rpc-url https://… --registry 0x3a99… --postage 0xcdfd… 10715650
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -51,15 +67,23 @@ OUTFILE="batch-balances.png"
 TSV="batch-balances.tsv"
 LOG_CHUNK=5000
 
+# Connection params: flags override env; env provides defaults.
+RPC_URL="${RPC_URL-}"
+REGISTRY="${REGISTRY-}"
+POSTAGE="${POSTAGE-}"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --rpc-url) RPC_URL="$2"; shift 2;;
+    --registry) REGISTRY="$2"; shift 2;;
+    --postage) POSTAGE="$2"; shift 2;;
     --step) STEP="$2"; shift 2;;
     --metric) METRIC="$2"; shift 2;;
     --render) RENDER="$2"; shift 2;;
     --out) OUTFILE="$2"; shift 2;;
     --tsv) TSV="$2"; shift 2;;
     --log-chunk) LOG_CHUNK="$2"; shift 2;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0;;
+    -h|--help) sed -n '2,60p' "$0"; exit 0;;
     --) shift; break;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) break;;
@@ -74,9 +98,15 @@ case "$METRIC" in remaining|total|normalised) ;;
 case "$RENDER" in png|svg|ascii) ;;
   *) echo "invalid --render: $RENDER" >&2; exit 2;; esac
 
-: "${RPC_URL:?RPC_URL env var required}"
-: "${REGISTRY:?REGISTRY env var required}"
-: "${POSTAGE:?POSTAGE env var required}"
+if [[ -z "$RPC_URL" ]]; then
+  echo "missing RPC_URL (--rpc-url flag or env var)" >&2; exit 2;
+fi
+if [[ -z "$REGISTRY" ]]; then
+  echo "missing REGISTRY (--registry flag or env var)" >&2; exit 2;
+fi
+if [[ -z "$POSTAGE" ]]; then
+  echo "missing POSTAGE (--postage flag or env var)" >&2; exit 2;
+fi
 
 for bin in uv python3; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing tool: $bin" >&2; exit 1; }
