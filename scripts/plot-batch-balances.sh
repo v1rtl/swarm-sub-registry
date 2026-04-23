@@ -317,6 +317,23 @@ def _step_points(xs, ys):
     return sx, sy
 
 
+def _integer_xticks(xs, count=5):
+    """Evenly sample `count` integer tick positions spanning xs, returned
+    as (positions, string-labels). Prevents plotext from rendering block
+    numbers as floats like 10716637.50."""
+    if not xs:
+        return [], []
+    lo, hi = int(min(xs)), int(max(xs))
+    if hi == lo:
+        return [lo], [str(lo)]
+    step = max(1, (hi - lo) // max(1, count - 1))
+    ticks = list(range(lo, hi + 1, step))
+    # Always pin the last tick exactly on `hi` for endpoint clarity.
+    if ticks[-1] != hi:
+        ticks.append(hi)
+    return ticks, [str(t) for t in ticks]
+
+
 def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> str:
     series = [(vid, list(batch_hist[vid])) for vid in batch_hist if batch_hist[vid]]
     header = (
@@ -325,6 +342,10 @@ def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> st
     )
     if not series:
         return header + "\n  (no active volumes)\n"
+
+    # Union of all x ranges so every subplot shares a common tick set.
+    all_xs = [p[0] for _, pts in series for p in pts]
+    xticks_pos, xticks_lab = _integer_xticks(all_xs)
 
     n = len(series)
     cols, _ = term_size()
@@ -338,6 +359,8 @@ def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> st
         plt.plot(sx, sy, marker="braille")
         plt.title(f"{vid[:18]}...")
         plt.ylabel("rem")
+        if xticks_pos:
+            plt.xticks(xticks_pos, xticks_lab)
     plt.plotsize(cols, max(n * 4, budget_rows))
     body = plt.build()
     return header + "\n" + body
@@ -358,6 +381,9 @@ def render_safe_figure(block_number: int, utc_iso: str, safe_bal: int, rows: int
     plt.plot(sx, sy, marker="braille")
     plt.ylabel("BZZ")
     plt.xlabel("block")
+    xticks_pos, xticks_lab = _integer_xticks(xs)
+    if xticks_pos:
+        plt.xticks(xticks_pos, xticks_lab)
     plt.plotsize(cols, rows)
     body = plt.build()
     return header + "\n" + body
