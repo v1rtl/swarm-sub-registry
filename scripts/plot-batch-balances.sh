@@ -108,6 +108,25 @@ if [[ -z "$POSTAGE" ]]; then
   echo "missing POSTAGE (--postage flag or env var)" >&2; exit 2;
 fi
 
+# Catch copy-paste mishaps early — urllib rejects non-ASCII URLs with an
+# ugly 30-line traceback otherwise.
+if ! printf '%s' "$RPC_URL" | LC_ALL=C grep -q '^[[:print:]]*$'; then
+  echo "RPC_URL contains non-ASCII characters (likely a copy-paste artifact " \
+       "such as '…' from an example). Use the full literal URL." >&2
+  echo "  got: $RPC_URL" >&2
+  exit 2
+fi
+if [[ ! "$RPC_URL" =~ ^https?:// ]]; then
+  echo "RPC_URL must start with http:// or https://  (got: $RPC_URL)" >&2
+  exit 2
+fi
+for v in "$REGISTRY" "$POSTAGE"; do
+  if [[ ! "$v" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+    echo "invalid address: $v (expected 0x-prefixed 20-byte hex)" >&2
+    exit 2
+  fi
+done
+
 for bin in uv python3; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing tool: $bin" >&2; exit 1; }
 done
