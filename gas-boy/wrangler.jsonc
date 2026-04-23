@@ -24,11 +24,14 @@
       "vars": {
         "RPC_URL": "https://ethereum-sepolia-rpc.publicnode.com",
         "CHAIN_ID": "11155111",
-        "REGISTRY_ADDRESS": "0x0000000000000000000000000000000000000000",
+        "REGISTRY_ADDRESS": "0x3a99b4b52a4bd75760667219ea93c627051b1af8",
         "POSTAGE_ADDRESS": "0xcdfdC3752caaA826fE62531E0000C40546eC56A6"
       },
       "triggers": {
-        "crons": ["*/30 * * * *"]
+        // graceBlocks=12 × ~13.5s avg Sepolia block time ≈ 2.7 min of
+        // runway per topup. Must fire more often than that or batches die
+        // between cycles (see commit 598be00 and related debug session).
+        "crons": ["* * * * *"]
       }
     }
   }
