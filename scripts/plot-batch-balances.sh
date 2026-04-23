@@ -623,9 +623,10 @@ else:
 fig, ax = plt.subplots(figsize=(14, 7))
 cmap = plt.get_cmap("tab20" if len(series) > 10 else "tab10")
 for i, (vid, vals) in enumerate(series.items()):
-    ax.plot(
+    ax.step(
         blocks,
         vals / scale,
+        where="post",
         label=vid[:12] + "…",
         linewidth=1.6,
         color=cmap(i % cmap.N),
