@@ -1,28 +1,12 @@
-# Swarm Volume Registry — Design (v2 proposal)
+# Swarm Volume Registry — Design
 
-> **Status note (added after repo walk on 2026-04-22).**
-> The currently-deployed contract is `contracts/src/SubscriptionRegistry.sol`,
-> a simpler payer-only model: `subscribe(batchId, extensionBlocks)` stores
-> `{payer, extensionBlocks}` per batchId; permissionless `keepalive()` tops
-> up any batch whose remaining per-chunk balance has dropped below
-> `extensionBlocks × lastPrice`. No owner/payer separation, no two-sided
-> auth handshake, no volume-lifecycle semantics.
->
-> **This document describes a v2 rework**, not an incremental change:
-> introduces the owner/payer split, `Account` handshake, volume state
-> machine, and four retirement edges. It is not what ships for the
-> 2026-04-24 demo. v1 demo ships on the existing `SubscriptionRegistry`;
-> `TEST-PLAN.md` targets that contract.
->
-> Treat this document as the target architecture for post-demo work.
-
-Companion to `words.md`. This document fixes the v2 architecture; rationale for deviations from `words.md` is captured inline.
+Companion to `words.md`. This document fixes the architecture; rationale for deviations from `words.md` is captured inline.
 
 ## 1. Goals
 
 Bring volume-lifecycle semantics and a two-role (owner / payer) ownership model to Swarm postage-stamp batches. A volume is a first-class object the owner manages; its underlying postage batch is an implementation detail kept alive by a keeper loop funded by a separately-authorized payer.
 
-Non-goals in v2:
+Non-goals:
 - Per-owner multiple funding sources.
 - Signer rotation, owner-level signing delegation.
 - Depth/size modifications (batches are strictly immutable-shape post-creation).
@@ -35,7 +19,7 @@ Non-goals in v2:
 | Actor | Type | Role |
 |---|---|---|
 | Owner | EOA or contract | Manages volume lifecycle: create, delete, transfer ownership, designate payer. |
-| Chunk signer | EOA | Signs chunks; identical to the underlying Postage batch owner. May equal the volume owner; in v2 may differ. |
+| Chunk signer | EOA | Signs chunks; identical to the underlying Postage batch owner. May equal the volume owner, or differ. |
 | Payer ("funding wallet") | EOA or Safe | Holds BZZ. Authorizes an owner as a permitted spender, revokes. |
 | Keeper ("gas boy") | Anyone | Off-chain service that calls `trigger(volumeId)` on a schedule. Pays xDAI for gas. |
 | Upload client | Off-chain | Submits chunks signed by the chunk signer to Swarm nodes. Out of scope for this registry. |
@@ -85,13 +69,25 @@ uint256   nextNonce;                            // monotonic counter passed to P
 
 ## 5. Invariants
 
+**Threat model.** Key-compromise probability is assumed to rank **signer ≫ owner > payer**: the chunk signer is a hot EOA used to sign uploads continuously, the owner is a management key touched rarely (create/delete/designate), and the payer is typically a vault or Safe touched even less often. The design aims to run blast radius in the opposite direction:
+
+- **Signer compromise.** Attacker can call `PostageStamp.increaseDepth(batchId, …)` directly on the batch (Postage checks `msg.sender == batch.owner == v.chunkSigner`). The next `trigger` observes `b.depth != v.depth` and retires `DepthChanged`; no further topups flow. Payer is not drained via the registry. Blast radius: one unauthorized depth expansion, funded by the attacker's own BZZ.
+- **Owner compromise.** While the account is active, the attacker can create arbitrary high-depth volumes and force topups on existing ones. The effective drain ceiling is whatever ERC20 allowance the payer has granted the registry — **this contract adds no further aggregate cap**. I8 is a per-call charge-correctness property, not an attacker-facing bound. Mitigations are detection + I9 (a single `revoke(owner)` disables the entire (owner, payer) pair in one tx) and payer hygiene (bounded periodic approvals rather than `approve(max_uint256)`).
+- **Payer compromise.** Outside the registry's protection boundary; if the payer's key is taken, funds are already under attacker control.
+
+The common profile owner == chunk-signer inherits the signer's threat class: the owner key is then also continuously hot. Users who want strong key isolation should keep owner and chunk-signer separate.
+
+Invariants:
+
 - **I1 — Volume ⇔ batch.** Every `Active` volume corresponds to a live Postage batch whose owner is `volume.chunkSigner` and whose depth is `volume.depth`.
 - **I2 — Batch immutability.** A volume is `Retired` if Postage reports its batch as expired, at a different depth than `volume.depth`, or at a different owner than `volume.chunkSigner`. (The last condition is defensive; current Postage does not mutate batch owner.)
 - **I3 — Payer bounded exposure.** BZZ can only leave `payer` via paymaster if: `accounts[owner].active == true`, `accounts[owner].payer == payer`, volume is `Active`, amount is bounded by (target balance − current balance) × chunks.
 - **I4 — Auth bilaterality.** An account is `Active` only after both `designateFundingWallet(payer)` by owner and `confirmAuth(owner)` by payer have been executed.
-- **I5 — Trigger idempotence.** Two consecutive `trigger(volumeId)` calls with no intervening block production topped-up zero. Computed target balance is the single source of truth; no timestamp-based rate limits.
+- **I5 — Trigger idempotence.** Two consecutive `trigger(volumeId)` calls with no intervening block production topped-up zero. Computed target balance is the single source of truth; no timestamp-based rate limits. (Across blocks the batch balance drains, so this is strictly a same-block / same-price property; it does *not* claim that repeated calls across a round boundary net to the same drain as a single call.)
 - **I6 — Survival.** A volume whose last successful create-or-topup was at block `t0` is guaranteed to survive at least `f × graceBlocks` blocks from `t0` before its batch dies, where `f` is the realization floor derived in §10.1 (`f ≈ 0.9567` for the Gnosis default `graceBlocks = 17280`). Under flat or falling prices the bound is achieved with equality / exceeded.
-- **I7 — Removal finality.** A `Retired` volume cannot be revived, receives no further topups, and is removed from `activeVolumeIds`.
+- **I7 — Removal finality.** A `Retired` volume cannot be revived, receives no further topups, and is removed from `activeVolumeIds`. Corollary: if no other volume uses the same `(owner, payer)` pair, no subsequent `trigger` or batched `trigger(ids[])` call can transfer BZZ from that payer on behalf of the retired volume.
+- **I8 — Charge correctness.** Every BZZ transfer the paymaster pulls from `accounts[owner].payer` equals the formula-computed amount and no more: exactly `max(0, graceBlocks × currentPrice − b.normalisedBalance) × (1 << v.depth)` per `trigger`, exactly `graceBlocks × currentPrice × (1 << depth)` per `createVolume`, and zero in any other code path. This is a mechanical-honesty property of the paymaster — the registry does not overcharge relative to the topup delivered to Postage. It is **not** an attacker-facing bound: an adversarial owner picks `depth` and call count, so aggregate exposure under owner compromise collapses to the payer's outstanding ERC20 allowance (see threat-model block above).
+- **I9 — Revocation atomicity.** A single `revoke(owner)` call causes every subsequent `trigger` on every volume owned by `owner` to take the `TopupSkipped(NoAuth)` branch (§8 step 5). Payer is resolved via `accounts[owner]` at trigger time rather than stored per-volume precisely so that revocation cost stays O(1) regardless of how many volumes the (owner, payer) pair manages.
 
 ## 6. State machines
 
@@ -252,7 +248,7 @@ Set once at construction; all three are immutable thereafter:
 - `graceBlocks ≥ PostageStamp(postage).minimumValidityBlocks()`. Otherwise `createBatch` would revert with `InsufficientBalance` on every `createVolume` (Postage's own floor is `minimumValidityBlocks × lastPrice` per chunk). Verified at deploy; contract refuses to instantiate if violated.
 - `postage` and `bzz` are non-zero.
 
-No admin role, no upgradeability for v2. Fresh deploy per chain. Target chain: **Gnosis Chain only** for v2.
+No admin role, no upgradeability. Fresh deploy per chain. Target chain: **Gnosis Chain only**.
 
 ### 10.1 Deviation bound for `graceBlocks = 17280`
 
@@ -290,11 +286,11 @@ So the registry guarantees that a volume whose last successful top-up was at blo
 
 **Changing `graceBlocks` later.** `graceBlocks` is constructor-immutable. A different runway target requires a redeploy. The invariant above is a property of the deployed value only.
 
-## 11. Gas-boy (off-chain)
+## 11. Keeper interface
 
-Serverless (Cloudflare Workers). Paginates `getActiveVolumes(offset, limit)`, applies operator-local policy filter (minimum depth, minimum created-to-expiry window, `accountActive`), batches ids, calls `trigger(ids[])`. Holds an xDAI-funded signer.
+The registry exposes a permissionless keeper surface (see §7.3): `trigger(volumeId)`, `trigger(bytes32[])`, `reap(volumeId)`, plus the `getActiveVolumes` view for enumeration. Any caller may drive it; the contract makes no assumptions about who runs a keeper, how often, or what policy they apply.
 
-Operator policy is purely off-chain; the contract admits any volume that meets its own invariants.
+The specific altruistic-operator service that this project ships (Cloudflare-hosted, cron-driven, chain and filter policy) is out of scope for this document and is described in its own design note. That service is one of possibly many keepers; the registry is neutral infrastructure.
 
 ## 12. Symmetries captured
 
@@ -303,7 +299,7 @@ Operator policy is purely off-chain; the contract admits any volume that meets i
 - Retirement edges: four parallel reasons, one terminal state.
 - Registry / Paymaster: identical-signature write paths for state, read paths for views.
 
-## 13. Deferred beyond v2
+## 13. Deferred
 
 - Per-volume payer override (multiple funding sources per owner).
 - Depth increase (coordinated signer + registry flow).
@@ -312,3 +308,4 @@ Operator policy is purely off-chain; the contract admits any volume that meets i
 - On-chain EIP-712 auth.
 - Operator roles with restricted management capabilities.
 - Reliability layer (timelock-gated claimable xDAI stash for keeper upkeep).
+- **Implicit self-designation** for the single-key profile (owner == payer). Nice-to-have: short-circuit the designate + confirm handshake when `msg.sender` is both owner and payer of the account being opened. Dropped from this version to keep one uniform auth path; can be layered on later without touching any existing invariant. (Originally sketched in `words.md` §Funding source designation.)
