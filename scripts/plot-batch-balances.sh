@@ -27,7 +27,7 @@
 #                    (default 0x1b5BB8C4Ea0E9B8a9BCd91Cc3B81513dB0bA8766)
 #
 # Runtime:
-#   --poll-interval SECS  (default 12, ~1 Sepolia block)
+#   --poll-interval SECS  (default 2)
 #   --history N           rolling samples per series (default 200)
 #   --duration SECS       auto-exit after N seconds (default: run forever)
 #
@@ -44,7 +44,7 @@ set -euo pipefail
 RPC_URL="${RPC_URL-}"
 REGISTRY="${REGISTRY-}"
 SAFE="${SAFE-0x1b5BB8C4Ea0E9B8a9BCd91Cc3B81513dB0bA8766}"
-POLL_INTERVAL=12
+POLL_INTERVAL=2
 HISTORY_N=200
 DURATION=0  # 0 = unbounded
 
@@ -101,13 +101,16 @@ export RPC_URL REGISTRY SAFE POLL_INTERVAL HISTORY_N DURATION
 exec uv run --quiet \
   --with "plotext" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sys
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -334,6 +337,39 @@ def _integer_xticks(xs, count=5):
     return ticks, [str(t) for t in ticks]
 
 
+_ANSI_RE = re.compile(r"\033\[[^m]*m")
+
+
+def _visual_len(s: str) -> int:
+    """Length of string as it appears on screen (ignoring ANSI escapes)."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _hstack_charts(parts: list[str], gap: int = 2) -> str:
+    """Place independently-rendered chart strings side by side.
+
+    Uses visual width (stripping ANSI codes) for alignment so colour
+    escapes don't misalign columns."""
+    if len(parts) == 1:
+        return parts[0]
+    split = [p.split("\n") for p in parts]
+    max_lines = max(len(s) for s in split)
+    for s in split:
+        while len(s) < max_lines:
+            s.append("")
+    # Measure widest visual line per column.
+    col_widths = [max((_visual_len(ln) for ln in s), default=0) for s in split]
+    spacer = " " * gap
+    rows = []
+    for row_cells in zip(*split):
+        padded = []
+        for cell, w in zip(row_cells, col_widths):
+            pad = w - _visual_len(cell)
+            padded.append(cell + "\033[0m" + " " * max(0, pad))
+        rows.append(spacer.join(padded))
+    return "\n".join(rows)
+
+
 def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> str:
     series = [(vid, list(batch_hist[vid])) for vid in batch_hist if batch_hist[vid]]
     header = (
@@ -343,42 +379,56 @@ def render_batch_figure(block_number: int, utc_iso: str, budget_rows: int) -> st
     if not series:
         return header + "\n  (no active volumes)\n"
 
-    # Union of all x ranges so every subplot shares a common tick set.
+    # Union of all x ranges so every chart shares a common tick set.
     all_xs = [p[0] for _, pts in series for p in pts]
     xticks_pos, xticks_lab = _integer_xticks(all_xs)
 
     n = len(series)
     cols, _ = term_size()
-    plt.clear_figure()
-    plt.subplots(n, 1)
-    for i, (vid, points) in enumerate(series):
-        plt.subplot(i + 1, 1)
+    GAP = 2
+    col_width = max(20, (cols - GAP * (n - 1)) // n)
+
+    # Render each batch as a fully independent figure to avoid plotext
+    # global-state leakage between plt.build() calls.
+    parts = []
+    for vid, points in series:
+        plt.clear_figure()
+        plt.canvas_color("default")
+        plt.axes_color("default")
+        plt.ticks_color("default")
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         sx, sy = _step_points(xs, ys)
-        plt.plot(sx, sy, marker="braille")
+        color = "#" + hashlib.md5(vid.encode()).hexdigest()[:6]
+        plt.plot(sx, sy, marker="braille", color=color)
         plt.title(f"{vid[:18]}...")
-        plt.ylabel("rem")
+        plt.ylabel("remaining")
+        plt.ylim(0)
         if xticks_pos:
             plt.xticks(xticks_pos, xticks_lab)
-    plt.plotsize(cols, max(n * 4, budget_rows))
-    body = plt.build()
+        plt.plotsize(col_width, budget_rows)
+        parts.append(plt.build())
+
+    body = _hstack_charts(parts, gap=GAP)
     return header + "\n" + body
 
 
 def render_safe_figure(block_number: int, utc_iso: str, safe_bal: int, rows: int) -> str:
     header = (
-        f"Safe {SAFE[:8]}...{SAFE[-6:]} — block {block_number} @ {utc_iso} | "
+        f"BZZ balance {SAFE[:8]}...{SAFE[-6:]} — block {block_number} @ {utc_iso} | "
         f"{safe_bal / 1e16:.6f} BZZ"
     )
     if not safe_hist:
         return header + "\n  (no samples yet)\n"
     cols, _ = term_size()
     plt.clear_figure()
+    plt.canvas_color("default")
+    plt.axes_color("default")
+    plt.ticks_color("default")
     xs = [p[0] for p in safe_hist]
     ys = [p[1] / 1e16 for p in safe_hist]
     sx, sy = _step_points(xs, ys)
-    plt.plot(sx, sy, marker="braille")
+    plt.plot(sx, sy, marker="braille", color="orange")
     plt.ylabel("BZZ")
     plt.xlabel("block")
     xticks_pos, xticks_lab = _integer_xticks(xs)
@@ -462,6 +512,7 @@ last_safe_bal = None
 # uncaught exception the terminal must be restored.
 if IS_TTY:
     sys.stdout.write(ALT_SCREEN_ENTER + CURSOR_HIDE)
+    sys.stdout.write(CLEAR_FRAME + "Fetching initial state…\n")
     sys.stdout.flush()
 
 try:
@@ -482,19 +533,27 @@ try:
         last_block = block
 
         try:
-            cto = read_cto()
-            vols = read_active_volumes()
-            safe_bal = read_safe_balance()
+            with ThreadPoolExecutor() as pool:
+                f_cto = pool.submit(read_cto)
+                f_vols = pool.submit(read_active_volumes)
+                f_safe = pool.submit(read_safe_balance)
+                cto = f_cto.result()
+                vols = f_vols.result()
+                safe_bal = f_safe.result()
         except RuntimeError as e:
             print(f"[plot] state read failed: {e}", file=sys.stderr)
             time.sleep(POLL_INTERVAL)
             continue
 
+        # Fetch all batch balances in parallel.
+        vids = [vid for vid, _depth in vols]
+        with ThreadPoolExecutor() as pool:
+            batch_results = list(pool.map(read_batch_nb, vids))
+
         # Update batch history. Drop pruned / dead / absent.
         active_vids = set()
-        for vid, _depth in vols:
+        for (vid, _depth), (owner, nb) in zip(vols, batch_results):
             active_vids.add(vid)
-            owner, nb = read_batch_nb(vid)
             if owner is None or owner == b"\x00" * 32:
                 # Pruned on PostageStamp — drop from chart.
                 batch_hist.pop(vid, None)
