@@ -701,34 +701,53 @@ elif max_finite < 1e18:
 else:
     scale, unit = 1e18, "×10¹⁸ (≈BZZ)"
 
-fig, ax = plt.subplots(figsize=(14, 7))
-cmap = plt.get_cmap("tab20" if len(series) > 10 else "tab10")
-for i, (vid, vals) in enumerate(series.items()):
-    ax.step(
-        blocks,
-        vals / scale,
-        where="post",
-        label=vid[:12] + "…",
-        linewidth=1.6,
-        color=cmap(i % cmap.N),
-    )
-
 metric_label = {
     "remaining": "per-chunk remaining",
     "total": "total remaining (remaining × 2^depth)",
     "normalised": "cumulative normalisedBalance",
 }.get(METRIC, METRIC)
 
-ax.set_title(
-    f"Postage batch balances — {metric_label}\n"
-    f"blocks {int(blocks[0])}..{int(blocks[-1])} ({len(blocks)} samples, "
-    f"{len(series)} volumes)"
+# One subplot per volume, shared x-axis. Overlaying was drowning the
+# per-series sawtooth when all volumes shared a topup schedule; separate
+# axes make individual drain/topup cycles legible. Each subplot auto-scales
+# its y-axis so a small pre-topup residual on one batch doesn't get
+# steamrolled by a freshly-topped-up sibling.
+n_series = len(series)
+row_h = 2.2  # inches per subplot
+fig, axes = plt.subplots(
+    nrows=n_series,
+    ncols=1,
+    figsize=(14, max(3.0, row_h * n_series + 1.0)),
+    sharex=True,
+    squeeze=False,
 )
-ax.set_xlabel("block number")
-ax.set_ylabel(f"balance ({unit})")
-ax.grid(True, alpha=0.3)
-ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
-fig.tight_layout()
+axes = axes[:, 0]  # flatten Nx1 → N
+
+cmap = plt.get_cmap("tab20" if n_series > 10 else "tab10")
+for i, (vid, vals) in enumerate(series.items()):
+    ax = axes[i]
+    ax.step(
+        blocks,
+        vals / scale,
+        where="post",
+        linewidth=1.6,
+        color=cmap(i % cmap.N),
+    )
+    ax.set_ylabel(f"{unit}")
+    ax.grid(True, alpha=0.3)
+    # Short id as per-subplot title, left-aligned.
+    ax.set_title(vid[:18] + "…", loc="left", fontsize=9, fontfamily="monospace")
+
+# Shared x-label only on the bottom subplot.
+axes[-1].set_xlabel("block number")
+
+fig.suptitle(
+    f"Postage batch balances — {metric_label}\n"
+    f"blocks {int(blocks[0])}..{int(blocks[-1])} "
+    f"({len(blocks)} samples, {n_series} volumes)",
+    fontsize=11,
+)
+fig.tight_layout(rect=(0, 0, 1, 0.98))  # leave room for suptitle
 fig.savefig(OUTFILE, dpi=120 if RENDER == "png" else None, bbox_inches="tight")
 print(f"[plot] wrote {OUTFILE}", file=sys.stderr)
 PY
