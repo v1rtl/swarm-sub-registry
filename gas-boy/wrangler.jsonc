@@ -28,7 +28,7 @@
         "POSTAGE_ADDRESS": "0xcdfdC3752caaA826fE62531E0000C40546eC56A6"
       },
       "triggers": {
-        "crons": ["*/5 * * * *"]
+        "crons": ["*/30 * * * *"]
       }
     }
   }
