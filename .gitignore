@@ -1,4 +1,5 @@
 orion/junk
+.env
 
 # Default output paths of scripts/plot-batch-balances.sh
 batch-balances.png
