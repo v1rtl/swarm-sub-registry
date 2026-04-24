@@ -1,14 +1,14 @@
 import { createPublicClient, http, parseAbi, formatUnits } from 'https://esm.sh/viem@2.21.40';
-import { sepolia } from 'https://esm.sh/viem@2.21.40/chains';
+import { gnosis } from 'https://esm.sh/viem@2.21.40/chains';
 
-// Sepolia Swarm testnet deployment (from ~/repo/storage-incentives/testnet_deployed.json)
-const BZZ_TOKEN     = '0x543dDb01Ba47acB11de34891cD86B675F04840db';
-const POSTAGE_STAMP = '0xcdfdC3752caaA826fE62531E0000C40546eC56A6';
+// Gnosis Chain Swarm mainnet deployment (per notes/usage.md §2).
+const BZZ_TOKEN     = '0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da';
+const POSTAGE_STAMP = '0x45a1502382541Cd610CC9068e88727426b696293';
 const BZZ_DECIMALS  = 16;
 const POLL_MS       = 2_000;
 const WINDOW_MS     = 10 * 60 * 1000;  // 10-minute sliding x-axis window
 
-const DEFAULT_ACCOUNT = '0x1b5BB8C4Ea0E9B8a9BCd91Cc3B81513dB0bA8766';
+const DEFAULT_ACCOUNT = '0x10D9aBA7E0F5534757E85d1E35C46F170E8821e1';  // demo Safe
 
 const params  = new URLSearchParams(window.location.search);
 const account = (params.get('account') || DEFAULT_ACCOUNT).trim();
@@ -22,15 +22,15 @@ const short    = h => h.slice(0, 6) + '…' + h.slice(-4);
 metaEl.innerHTML =
   `account=<b>${short(account)}</b>  ·  batches=<b>${batches.length}</b>  ·  poll=<b>${POLL_MS/1000}s</b>`;
 
-if (!window.SEP_RPC_URL) {
-  statusEl.textContent = 'config.js missing or SEP_RPC_URL not set — run ./run.sh';
+if (!window.RPC_URL) {
+  statusEl.textContent = 'config.js missing or RPC_URL not set — run ./run.sh';
   statusEl.className = 'err';
   throw new Error('no RPC URL');
 }
 
 const client = createPublicClient({
-  chain: sepolia,
-  transport: http(window.SEP_RPC_URL),
+  chain: gnosis,
+  transport: http(window.RPC_URL),
 });
 
 const erc20Abi   = parseAbi(['function balanceOf(address) view returns (uint256)']);
