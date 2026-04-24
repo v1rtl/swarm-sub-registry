@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Propose a single Safe transaction that batches (via MultiSendCallOnly):
-#   - optionally: BZZ.approve(REGISTRY, APPROVE_AMOUNT)  [only if current allowance is 0]
+#   - optionally: BZZ.approve(REGISTRY, APPROVE_AMOUNT)            [if current allowance is 0]
+#   - optionally: REGISTRY.designateFundingWallet(Safe)            [if Safe account is not active]
+#   - optionally: REGISTRY.confirmAuth(Safe)                       [if Safe account is not active]
 #   - createVolume × 3
+#
+# The Safe self-designates as its own payer (Profile A with Safe instead of
+# EOA). Account handshake is two calls but both are msg.sender == Safe so
+# they can land in the same MultiSend.
 #
 # The Safe transaction itself is a DELEGATECALL to MultiSendCallOnly, which
 # executes each inner call with CALL semantics from the Safe. No on-chain
@@ -61,6 +67,11 @@ NONCE="${NONCE_RAW%% *}"
 ALLOWANCE_RAW="$(cast call "$BZZ" "allowance(address,address)(uint256)" "$SAFE" "$REGISTRY" --rpc-url "$RPC")"
 ALLOWANCE="${ALLOWANCE_RAW%% *}"
 
+# getAccount(address) returns (address payer, bool active). Read both as separate fields.
+ACCOUNT_RAW="$(cast call "$REGISTRY" "getAccount(address)(address,bool)" "$SAFE" --rpc-url "$RPC")"
+ACCOUNT_PAYER="$(echo "$ACCOUNT_RAW" | awk 'NR==1 {print $1}')"
+ACCOUNT_ACTIVE="$(echo "$ACCOUNT_RAW" | awk 'NR==2 {print $1}')"
+
 echo "Safe:           $SAFE"
 echo "Registry:       $REGISTRY"
 echo "BZZ:            $BZZ"
@@ -72,6 +83,8 @@ echo "Depth:          $DEPTH  (bucketDepth=$BUCKET_DEPTH, immutable=$IMMUTABLE)"
 echo "TTL expiry:     $TTL_EXPIRY  (now + ${TTL_DAYS}d)"
 echo "Safe nonce:     $NONCE"
 echo "BZZ allowance:  $ALLOWANCE"
+echo "Account payer:  $ACCOUNT_PAYER"
+echo "Account active: $ACCOUNT_ACTIVE"
 echo
 
 # --- Helpers -----------------------------------------------------------------
@@ -97,12 +110,26 @@ pack_tx() {
 
 PACKED=""
 
+BATCH_STEPS=()
+
 if [[ "$ALLOWANCE" == "0" ]]; then
   echo "allowance is zero → including approve in the batch"
   APPROVE_DATA="$(cast calldata "approve(address,uint256)" "$REGISTRY" "$APPROVE_AMOUNT")"
   PACKED+="$(pack_tx "$BZZ" "$APPROVE_DATA")"
+  BATCH_STEPS+=("approve")
 else
   echo "allowance > 0 → skipping approve"
+fi
+
+if [[ "$ACCOUNT_ACTIVE" != "true" ]]; then
+  echo "account not active → including designateFundingWallet(Safe) + confirmAuth(Safe) (self-designation)"
+  DESIGNATE_DATA="$(cast calldata "designateFundingWallet(address)" "$SAFE")"
+  CONFIRM_DATA="$(cast calldata "confirmAuth(address)" "$SAFE")"
+  PACKED+="$(pack_tx "$REGISTRY" "$DESIGNATE_DATA")"
+  PACKED+="$(pack_tx "$REGISTRY" "$CONFIRM_DATA")"
+  BATCH_STEPS+=("designateFundingWallet" "confirmAuth")
+else
+  echo "account already active (payer=$ACCOUNT_PAYER) → skipping handshake"
 fi
 
 CREATE_DATA="$(cast calldata \
@@ -111,6 +138,7 @@ CREATE_DATA="$(cast calldata \
 
 for _ in 1 2 3; do
   PACKED+="$(pack_tx "$REGISTRY" "$CREATE_DATA")"
+  BATCH_STEPS+=("createVolume")
 done
 
 # --- Wrap in multiSend(bytes) and propose -----------------------------------
@@ -147,5 +175,5 @@ fi
 rm -f "$RESP_FILE"
 
 echo
-echo "Queued one MultiSend proposal bundling $([[ "$ALLOWANCE" == "0" ]] && echo "approve + ")3× createVolume."
+echo "Queued one MultiSend proposal bundling: ${BATCH_STEPS[*]}"
 echo "Queue: https://app.safe.global/transactions/queue?safe=gno:$SAFE"
