@@ -35,11 +35,29 @@ The contract does not custody BZZ, does not sign chunks, is not upgradeable, and
 
 ## 2. Deployments
 
-| Chain | `VolumeRegistry` | `PostageStamp` | `BZZ` | `PriceOracle` | `graceBlocks` |
-|---|---|---|---|---|---|
-| Gnosis Chain | `0x0000000000000000000000000000000000000000` (placeholder; not yet deployed) | `0x45a1502382541Cd610CC9068e88727426b696293` | `0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da` | `0x47EeF336e7fE5bED98499A4696bce8f28c1B0a8b` | `17280` |
+### Mainnet — Gnosis Chain (chain ID 100)
 
-`graceBlocks` is constructor-immutable. A different runway target requires a fresh deployment.
+| Contract | Address |
+|---|---|
+| `VolumeRegistry` | `0x0000000000000000000000000000000000000000` (placeholder; not yet deployed) |
+| `PostageStamp` | `0x45a1502382541Cd610CC9068e88727426b696293` |
+| `BZZ` | `0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da` |
+| `PriceOracle` | `0x47EeF336e7fE5bED98499A4696bce8f28c1B0a8b` |
+| `graceBlocks` | `17280` (≈ 24 h at 5-second blocks) |
+
+### Testnet — Sepolia (chain ID 11155111)
+
+| Contract | Address |
+|---|---|
+| `VolumeRegistry` | `0x3a99b4b52a4bd75760667219ea93c627051b1af8` |
+| `PostageStamp` | `0xcdfdC3752caaA826fE62531E0000C40546eC56A6` |
+| `BZZ` (TestToken) | `0x543dDb01Ba47acB11de34891cD86B675F04840db` |
+| `PriceOracle` | `0x95Dc18380e92C13E4F8a4e94C99FB1b97250174B` |
+| `graceBlocks` | `12` (≈ 2.4 min at 12-second blocks) |
+
+The Sepolia `graceBlocks` is deliberately tiny to make demo sawtooths visible on short timescales. A keeper runs every minute against this deployment, but it is best-effort — integration tests should not rely on it and should either call `trigger` directly or run their own keeper.
+
+`graceBlocks` is constructor-immutable per deployment. A different runway target requires a fresh deployment.
 
 At runtime you can discover the chain-local dependencies from the registry itself:
 
@@ -294,7 +312,39 @@ Two currencies are involved.
 
 ### BZZ — storage
 
-Postage's per-chunk per-block price is one number, read from the oracle:
+**Step 1 — pick a depth from your target volume.** Swarm's effective batch volume at each `depth` (unencrypted, no erasure coding) is:
+
+| `depth` | Effective volume |
+|---|---|
+| 17 | 44.70 kB |
+| 18 | 6.66 MB |
+| 19 | 112.06 MB |
+| 20 | 687.62 MB |
+| 21 | 2.60 GB |
+| 22 | 7.73 GB |
+| 23 | 19.94 GB |
+| 24 | 47.06 GB |
+| 25 | 105.51 GB |
+| 26 | 227.98 GB |
+| 27 | 476.68 GB |
+| 28 | 993.65 GB |
+| 29 | 2.04 TB |
+| 30 | 4.17 TB |
+| 31 | 8.45 TB |
+| 32 | 17.07 TB |
+| 33 | 34.36 TB |
+| 34 | 69.04 TB |
+| 35 | 138.54 TB |
+| 36 | 277.72 TB |
+| 37 | 556.35 TB |
+| 38 | 1.11 PB |
+| 39 | 2.23 PB |
+| 40 | 4.46 PB |
+| 41 | 8.93 PB |
+
+Pick the smallest `depth` whose effective volume exceeds your payload. Example: to store 1 GB you need `depth = 21` (≈ 2.60 GB effective); `depth = 20` at 687.62 MB is not enough. Effective volume is below the theoretical `(1 << depth) × 4 KiB` because chunks distribute unevenly across Swarm's neighbourhoods and a full batch is bucket-limited, not chunk-limited. For encrypted uploads or uploads with erasure coding, use the corresponding columns in the upstream table at <https://docs.ethswarm.org/docs/concepts/incentives/postage-stamps>.
+
+**Step 2 — estimate daily cost.** Postage's per-chunk per-block price is one number, read from the oracle:
 
 ```sh
 cast call $POSTAGE "lastPrice()(uint64)"              # current price, PLUR per chunk per block
@@ -305,33 +355,16 @@ cast call $REGISTRY "graceBlocks()(uint64)"           # 17280 on Gnosis
 Formulas (all in PLUR = 10⁻¹⁶ BZZ):
 
 - **Initial charge at `createVolume`:** `graceBlocks × currentPrice × (1 << depth)`.
-- **Steady-state drain rate:** `currentPrice × (1 << depth)` per block. At 5-second Gnosis blocks: `currentPrice × (1 << depth) / 5` PLUR per second.
+- **Steady-state drain rate:** `currentPrice × (1 << depth)` per block. On Gnosis (17280 blocks/day) the daily burn is `currentPrice × (1 << depth) × 17280` PLUR/day, or `currentPrice × (1 << depth) × 17280 × 10⁻¹⁶` BZZ/day.
 - **Per-topup charge:** up to the initial charge, usually less — the registry only tops up the observed deficit back to target.
 
-For a safe allowance, compute your projected N-day drain at the current price, then multiply by a margin (e.g. 2×) to absorb price rises and let you skip re-approvals:
+**Allowance sizing.** Compute your projected N-day drain at the current price, then multiply by a margin (e.g. 2×) to absorb price rises and let you skip re-approvals:
 
 ```
-allowance ≥  currentPrice × (1 << depth) × blocksPerDay × N × 2
+allowance ≥  currentPrice × (1 << depth) × 17280 × N × 2
 ```
 
-where `blocksPerDay = 17280` on Gnosis.
-
-### Batch size and the utilization gotcha
-
-Nominal batch size is `(1 << depth) × 4 KiB`, because each chunk is 4 KiB. Effective usable size is smaller, because chunks distribute over `2^bucketDepth` buckets and buckets can overflow before the batch as a whole is full. Smaller batches suffer more from this — at low depths you can lose a large fraction of nominal capacity.
-
-Swarm's documentation explains bucket-utilization in detail and is the source of truth on how to size a batch for a given target payload. Do not pick depth purely from the nominal table below:
-
-| `depth` | Nominal size (chunks × 4 KiB) |
-|---|---|
-| 17 | 512 MiB |
-| 18 | 1 GiB |
-| 20 | 4 GiB |
-| 22 | 16 GiB |
-| 24 | 64 GiB |
-| 28 | 1 TiB |
-
-See Swarm documentation (<https://docs.ethswarm.org>) for the utilization adjustment.
+Larger allowances amortize re-approval overhead; smaller allowances cap the blast radius of owner-key compromise (§4 Profile B).
 
 ### xDAI — gas
 
