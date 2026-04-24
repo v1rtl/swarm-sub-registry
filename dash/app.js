@@ -1,26 +1,36 @@
-import { createPublicClient, http, parseAbi, formatUnits } from 'https://esm.sh/viem@2.21.40';
+import { createPublicClient, http, webSocket, parseAbi, formatUnits } from 'https://esm.sh/viem@2.21.40';
 import { gnosis } from 'https://esm.sh/viem@2.21.40/chains';
 
 // Gnosis Chain Swarm mainnet deployment (per notes/usage.md §2).
-const BZZ_TOKEN     = '0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da';
-const POSTAGE_STAMP = '0x45a1502382541Cd610CC9068e88727426b696293';
-const BZZ_DECIMALS  = 16;
-const POLL_MS       = 2_000;
-const WINDOW_MS     = 10 * 60 * 1000;  // 10-minute sliding x-axis window
+const BZZ_TOKEN        = '0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da';
+const POSTAGE_STAMP    = '0x45a1502382541Cd610CC9068e88727426b696293';
+const DEFAULT_REGISTRY = '0x9639Ae4C7A8Fa9efE585738d516a3915DdD02aAD';
+const BZZ_DECIMALS     = 16;
+const POLL_MS          = 2_000;
+const WINDOW_MS        = 10 * 60 * 1000;  // 10-minute sliding x-axis window
 
 const DEFAULT_ACCOUNT = '0x10D9aBA7E0F5534757E85d1E35C46F170E8821e1';  // demo Safe
 
-const params  = new URLSearchParams(window.location.search);
-const account = (params.get('account') || DEFAULT_ACCOUNT).trim();
-const batches = (params.get('batches') || '')
+const params   = new URLSearchParams(window.location.search);
+const account  = (params.get('account')  || DEFAULT_ACCOUNT).trim();
+const registry = (params.get('registry') || DEFAULT_REGISTRY).trim();
+
+// Explicit `?batches=` overrides registry discovery; keep the escape hatch
+// for raw postage batches that aren't tracked as volumes.
+const manualBatches = (params.get('batches') || '')
   .split(',').map(s => s.trim()).filter(Boolean);
+const useRegistryDiscovery = manualBatches.length === 0;
 
 const statusEl = document.getElementById('status');
 const metaEl   = document.getElementById('meta');
 const short    = h => h.slice(0, 6) + '…' + h.slice(-4);
 
-metaEl.innerHTML =
-  `account=<b>${short(account)}</b>  ·  batches=<b>${batches.length}</b>  ·  poll=<b>${POLL_MS/1000}s</b>`;
+function renderMeta(n) {
+  const src = useRegistryDiscovery ? `registry=<b>${short(registry)}</b>` : `manual=<b>${manualBatches.length}</b>`;
+  metaEl.innerHTML =
+    `account=<b>${short(account)}</b>  ·  ${src}  ·  volumes=<b>${n}</b>  ·  poll=<b>${POLL_MS/1000}s</b>`;
+}
+renderMeta(0);
 
 if (!window.RPC_URL) {
   statusEl.textContent = 'config.js missing or RPC_URL not set — run ./run.sh';
@@ -28,27 +38,77 @@ if (!window.RPC_URL) {
   throw new Error('no RPC URL');
 }
 
+// viem's `http()` transport only speaks HTTP(S); if the caller supplied a
+// websocket URL, switch to `webSocket()`. Without this the dashboard fails
+// silently on wss:// URLs (multicall throws, status shows an error, no
+// datapoints accumulate — matching the "balance not tracking" symptom).
+const rpcUrl = window.RPC_URL;
+const transport = /^wss?:\/\//i.test(rpcUrl) ? webSocket(rpcUrl) : http(rpcUrl);
+
 const client = createPublicClient({
   chain: gnosis,
-  transport: http(window.RPC_URL),
+  transport,
 });
 
-const erc20Abi   = parseAbi(['function balanceOf(address) view returns (uint256)']);
-const postageAbi = parseAbi(['function remainingBalance(bytes32) view returns (uint256)']);
+const erc20Abi    = parseAbi(['function balanceOf(address) view returns (uint256)']);
+const postageAbi  = parseAbi(['function remainingBalance(bytes32) view returns (uint256)']);
+const registryAbi = parseAbi([
+  'function getActiveVolumeCount() view returns (uint256)',
+  'function getActiveVolumes(uint256 offset, uint256 limit) view returns ((bytes32 volumeId, address owner, address payer, address chunkSigner, uint64 createdAt, uint64 ttlExpiry, uint8 depth, uint8 status, bool accountActive)[])',
+]);
 
-// Forward-only series storage. One series for the account BZZ balance, one per batch.
+// Forward-only series storage. Balance is a single series; per-volume
+// histories are keyed by volumeId so new volumes appear automatically and
+// retired/pruned ones are dropped.
 const balanceSeries = { x: [], y: [] };
-const batchSeries   = batches.map(b => ({ x: [], y: [], id: b }));
+/** @type {Map<string, {x: Date[], y: number[]}>} */
+const batchSeriesMap = new Map();
+
+// Seed manual overrides (if any) so the Map has entries before the first
+// poll returns, keeping insertion order stable for the color cycle.
+for (const b of manualBatches) {
+  batchSeriesMap.set(b.toLowerCase(), { x: [], y: [] });
+}
+
+/** Return the list of bytes32 batch IDs we want to chart this cycle. */
+async function discoverBatches() {
+  if (!useRegistryDiscovery) return manualBatches;
+  // Two-call sequence: count, then fetch page of that size. Registries
+  // with >500 active volumes would need paging; fine for the demo.
+  const count = await client.readContract({
+    address: registry, abi: registryAbi, functionName: 'getActiveVolumeCount',
+  });
+  if (count === 0n) return [];
+  const vols = await client.readContract({
+    address: registry, abi: registryAbi, functionName: 'getActiveVolumes',
+    args: [0n, count],
+  });
+  const acct = account.toLowerCase();
+  return vols
+    .filter(v => v.owner.toLowerCase() === acct)
+    .map(v => v.volumeId);
+}
 
 async function poll() {
+  console.log('[poll] firing', new Date().toISOString());
+
+  let vids;
+  try {
+    vids = await discoverBatches();
+  } catch (e) {
+    console.error('[poll] discovery error', e);
+    statusEl.textContent = `registry discovery error: ${e.shortMessage || e.message}`;
+    statusEl.className = 'err';
+    return;
+  }
+
   const contracts = [
     { address: BZZ_TOKEN, abi: erc20Abi, functionName: 'balanceOf', args: [account] },
-    ...batches.map(b => ({
+    ...vids.map(b => ({
       address: POSTAGE_STAMP, abi: postageAbi, functionName: 'remainingBalance', args: [b],
     })),
   ];
 
-  console.log('[poll] firing', new Date().toISOString());
   let results;
   try {
     results = await client.multicall({ contracts, allowFailure: true });
@@ -58,25 +118,42 @@ async function poll() {
     statusEl.className = 'err';
     return;
   }
-  console.log('[poll] results', results);
+  console.log('[poll] vids', vids.length, 'results', results);
 
   const now = new Date();
   const r0 = results[0];
   if (r0.status === 'success') {
-    // ERC20 balanceOf -> total BZZ held; scale by token decimals.
     balanceSeries.x.push(now);
     balanceSeries.y.push(Number(formatUnits(r0.result, BZZ_DECIMALS)));
   }
-  for (let i = 0; i < batches.length; i++) {
+
+  // Normalise to lowercase so Map lookups survive checksum drift between
+  // the registry tuple and any manual URL override.
+  const liveKeys = new Set(vids.map(v => v.toLowerCase()));
+  for (let i = 0; i < vids.length; i++) {
     const r = results[i + 1];
-    if (r.status === 'success') {
-      // remainingBalance is per-chunk wei (not whole BZZ). Don't divide by 1e16
-      // or it visually rounds to zero. Show raw wei/chunk.
-      batchSeries[i].x.push(now);
-      batchSeries[i].y.push(Number(r.result));
+    if (r.status !== 'success') continue;  // pruned / dead / RPC glitch
+    const key = vids[i].toLowerCase();
+    let series = batchSeriesMap.get(key);
+    if (!series) {
+      series = { x: [], y: [] };
+      batchSeriesMap.set(key, series);
+    }
+    // remainingBalance is per-chunk wei (not whole BZZ). Don't divide by 1e16
+    // or it visually rounds to zero. Show raw wei/chunk.
+    series.x.push(now);
+    series.y.push(Number(r.result));
+  }
+
+  // Drop volumes that disappeared (retired/pruned). Keep manual entries
+  // even if they don't appear — the user asked for them explicitly.
+  if (useRegistryDiscovery) {
+    for (const key of batchSeriesMap.keys()) {
+      if (!liveKeys.has(key)) batchSeriesMap.delete(key);
     }
   }
 
+  renderMeta(batchSeriesMap.size);
   statusEl.className = '';
   statusEl.textContent =
     `the cards were last consulted at ${now.toLocaleTimeString()}  ·  ${balanceSeries.x.length} omens gathered  ·  next vision in ${POLL_MS/1000}s`;
@@ -114,9 +191,9 @@ function redraw() {
   const series = [
     { x: balanceSeries.x.slice(), y: balanceSeries.y.slice(),
       label: `${short(account)} BZZ`, yTitle: 'BZZ' },
-    ...batchSeries.map(s => ({
+    ...Array.from(batchSeriesMap.entries()).map(([id, s]) => ({
       x: s.x.slice(), y: s.y.slice(),
-      label: short(s.id), yTitle: `${short(s.id)}<br>wei/chunk`,
+      label: short(id), yTitle: `${short(id)}<br>wei/chunk`,
     })),
   ];
 
