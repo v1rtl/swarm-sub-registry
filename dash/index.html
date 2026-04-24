@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Crypt of the Postage Stamps</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Pirata+One&family=UnifrakturMaguntia&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-deep:    #07050c;
+    --bg-stone:   #14101c;
+    --stone:      #2a2233;
+    --stone-hi:   #3d3346;
+    --stone-lo:   #0a0612;
+    --blood:      #8b1a1a;
+    --blood-hi:   #b8252b;
+    --candle:     #d9a860;
+    --bone:       #d4c8a8;
+    --mist:       #6a6275;
+    --moss:       #6b8e3d;
+    --iron:       #2d2730;
+    --iron-hi:    #54495e;
+  }
+
+  html, body { background: var(--bg-deep); }
+
+  /* ── Castlevania II fleur-de-lis stone wall, tiled ── */
+  body {
+    margin: 0; padding: 32px 96px;
+    color: var(--bone);
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    min-height: 100vh;
+    position: relative;
+    background-color: var(--bg-deep);
+    background-image:
+      radial-gradient(ellipse at 20% 0%, rgba(217,168,96,0.07) 0%, transparent 40%),
+      radial-gradient(ellipse at 80% 100%, rgba(139,26,26,0.10) 0%, transparent 50%),
+      url('./assets/stone_tile.png');
+    background-size: auto, auto, 64px 64px;  /* 16x16 sprite scaled 4x */
+    background-repeat: no-repeat, no-repeat, repeat;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+
+  /* darken edges (vignette) so the centre feels lit by torchlight */
+  body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    background: radial-gradient(ellipse at 50% 45%, transparent 35%, rgba(0,0,0,0.75) 100%);
+  }
+
+  /* ── Chains down each side of the page ── */
+  .chain {
+    position: fixed; top: 0; bottom: 0; width: 56px;
+    pointer-events: none; z-index: 2;
+    filter: drop-shadow(2px 0 4px rgba(0,0,0,0.8));
+  }
+  .chain-left  { left: 8px; }
+  .chain-right { right: 8px; transform: scaleX(-1); }
+
+  /* ── Drifting fog overlay ── */
+  .fog {
+    position: fixed; inset: 0; pointer-events: none; z-index: 3;
+    background:
+      radial-gradient(ellipse 600px 200px at 20% 30%, rgba(180,180,200,0.06), transparent 70%),
+      radial-gradient(ellipse 800px 250px at 70% 60%, rgba(180,180,200,0.05), transparent 70%),
+      radial-gradient(ellipse 500px 180px at 40% 90%, rgba(180,180,200,0.07), transparent 70%);
+    animation: fog-drift 45s ease-in-out infinite alternate;
+    mix-blend-mode: screen;
+  }
+  @keyframes fog-drift {
+    0%   { transform: translate(-3%, 0); opacity: 0.7; }
+    50%  { transform: translate( 2%, -1%); opacity: 1.0; }
+    100% { transform: translate( 4%, 1%); opacity: 0.85; }
+  }
+
+  /* ── Header & content ── */
+  header {
+    position: relative; z-index: 10;
+    display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap;
+    margin-bottom: 24px; padding: 6px 0 18px 0;
+    border-bottom: 1px solid var(--stone);
+  }
+
+  .title-wrap { position: relative; }
+  h1 {
+    font-family: 'UnifrakturMaguntia', 'Pirata One', serif;
+    font-size: 38px; margin: 0; font-weight: 400;
+    color: var(--blood-hi);
+    text-shadow:
+      0 0 8px rgba(184,37,43,0.7),
+      0 0 22px rgba(139,26,26,0.45),
+      2px 2px 0 #000;
+    letter-spacing: 1px;
+    animation: flicker 4.2s infinite;
+  }
+  @keyframes flicker {
+    0%, 100%   { opacity: 1; text-shadow: 0 0 8px rgba(184,37,43,0.7), 0 0 22px rgba(139,26,26,0.45), 2px 2px 0 #000; }
+    47%        { opacity: 1; }
+    48%        { opacity: 0.55; text-shadow: 0 0 4px rgba(184,37,43,0.4), 2px 2px 0 #000; }
+    49%        { opacity: 1; }
+    71%        { opacity: 1; }
+    72%        { opacity: 0.7; }
+    73%        { opacity: 1; }
+  }
+
+  /* dripping blood under the title */
+  .drips {
+    position: absolute; left: 0; right: 0; top: 100%;
+    height: 32px; pointer-events: none;
+  }
+
+  .meta {
+    font-family: 'Pirata One', 'Cormorant Garamond', serif;
+    font-size: 15px; color: var(--mist); letter-spacing: 0.5px;
+  }
+  .meta b { color: var(--candle); font-weight: 400; }
+
+  #status {
+    font-family: 'Pirata One', serif;
+    font-size: 15px; color: var(--moss); font-style: italic;
+  }
+  #status.err { color: var(--blood-hi); }
+
+  #plot {
+    position: relative; z-index: 10;
+    width: 100%; height: 80vh;
+    border: 2px solid var(--stone-hi);
+    border-radius: 2px;
+    box-shadow:
+      inset 0 0 80px rgba(0,0,0,0.7),
+      0 0 40px rgba(0,0,0,0.9),
+      0 0 0 4px var(--bg-deep),
+      0 0 0 5px var(--iron);
+    background: var(--bg-stone);
+  }
+
+  /* Castlevania II knight-on-horseback sprite, riding across the bottom-right
+     of the viewport on top of the plot. Pixel-scaled 6x. */
+  .knight {
+    position: fixed;
+    right: 80px; bottom: 24px;
+    width: 192px; height: 138px;        /* 32x23 src × 6 */
+    background: url('./assets/knight.png') no-repeat center / contain;
+    image-rendering: pixelated;
+    z-index: 100;
+    filter: drop-shadow(3px 3px 0 rgba(0,0,0,0.95));
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Chains (vertical pattern, drawn once and tiled by SVG <pattern>) ── -->
+<svg class="chain chain-left" preserveAspectRatio="xMidYMin meet" viewBox="0 0 56 200">
+  <defs>
+    <pattern id="chainpat-l" x="0" y="0" width="56" height="80" patternUnits="userSpaceOnUse">
+      <!-- vertical link -->
+      <ellipse cx="28" cy="20" rx="11" ry="20" fill="none" stroke="#1a141f" stroke-width="6"/>
+      <ellipse cx="28" cy="20" rx="11" ry="20" fill="none" stroke="#54495e" stroke-width="2"/>
+      <ellipse cx="28" cy="20" rx="8"  ry="17" fill="none" stroke="#0a0710" stroke-width="1.2"/>
+      <!-- horizontal link -->
+      <ellipse cx="28" cy="60" rx="20" ry="11" fill="none" stroke="#1a141f" stroke-width="6"/>
+      <ellipse cx="28" cy="60" rx="20" ry="11" fill="none" stroke="#54495e" stroke-width="2"/>
+      <ellipse cx="28" cy="60" rx="17" ry="8"  fill="none" stroke="#0a0710" stroke-width="1.2"/>
+    </pattern>
+  </defs>
+  <rect width="56" height="100%" fill="url(#chainpat-l)"/>
+</svg>
+<svg class="chain chain-right" preserveAspectRatio="xMidYMin meet" viewBox="0 0 56 200">
+  <defs>
+    <pattern id="chainpat-r" x="0" y="0" width="56" height="80" patternUnits="userSpaceOnUse">
+      <ellipse cx="28" cy="20" rx="11" ry="20" fill="none" stroke="#1a141f" stroke-width="6"/>
+      <ellipse cx="28" cy="20" rx="11" ry="20" fill="none" stroke="#54495e" stroke-width="2"/>
+      <ellipse cx="28" cy="20" rx="8"  ry="17" fill="none" stroke="#0a0710" stroke-width="1.2"/>
+      <ellipse cx="28" cy="60" rx="20" ry="11" fill="none" stroke="#1a141f" stroke-width="6"/>
+      <ellipse cx="28" cy="60" rx="20" ry="11" fill="none" stroke="#54495e" stroke-width="2"/>
+      <ellipse cx="28" cy="60" rx="17" ry="8"  fill="none" stroke="#0a0710" stroke-width="1.2"/>
+    </pattern>
+  </defs>
+  <rect width="56" height="100%" fill="url(#chainpat-r)"/>
+</svg>
+
+<div class="fog"></div>
+
+<header>
+  <div class="title-wrap">
+    <h1>Crypt of the Postage Stamps</h1>
+    <svg class="drips" viewBox="0 0 600 32" preserveAspectRatio="none">
+      <g fill="#8b1a1a" filter="drop-shadow(0 0 2px rgba(139,26,26,0.6))">
+        <path d="M30 0 Q30 14 33 22 Q36 28 33 30 Q30 28 30 22 Z"/>
+        <path d="M120 0 Q120 8 122 14 L122 18 Q121 19 120 18 Z"/>
+        <path d="M210 0 Q210 18 213 26 Q216 30 213 31 Q210 30 210 26 Z"/>
+        <path d="M300 0 Q300 6 302 10 L302 12 Q301 13 300 12 Z"/>
+        <path d="M390 0 Q390 22 393 28 Q397 32 394 31 Q390 30 390 28 Z"/>
+        <path d="M470 0 Q470 10 472 16 L472 19 Q471 20 470 19 Z"/>
+        <path d="M555 0 Q555 16 558 22 Q561 26 558 28 Q555 26 555 22 Z"/>
+      </g>
+    </svg>
+  </div>
+  <span class="meta" id="meta"></span>
+  <span id="status">summoning…</span>
+</header>
+
+<div id="plot"></div>
+<div class="knight" title="Simon Belmont approaches"></div>
+
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<script src="./config.js"></script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
