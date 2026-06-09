@@ -22,16 +22,19 @@
   "env": {
     "production": {
       "vars": {
-        "RPC_URL": "https://ethereum-sepolia-rpc.publicnode.com",
-        "CHAIN_ID": "11155111",
-        "REGISTRY_ADDRESS": "0x3a99b4b52a4bd75760667219ea93c627051b1af8",
-        "POSTAGE_ADDRESS": "0xcdfdC3752caaA826fE62531E0000C40546eC56A6"
+        // Gnosis mainnet. RPC_URL is the first-tried endpoint; registry.ts
+        // wraps it in a viem `fallback` transport behind the free public
+        // Gnosis RPCs, so a throttled/dead primary no longer halts the cron
+        // (1rpc.io/gnosis hit its usage cap and threw every cycle — see
+        // gas-boy RPC-fallback debug session).
+        "RPC_URL": "https://gnosis-rpc.publicnode.com",
+        "CHAIN_ID": "100",
+        "REGISTRY_ADDRESS": "0x9639Ae4C7A8Fa9efE585738d516a3915DdD02aAD",
+        "POSTAGE_ADDRESS": "0x45a1502382541Cd610CC9068e88727426b696293"
       },
       "triggers": {
-        // graceBlocks=12 × ~13.5s avg Sepolia block time ≈ 2.7 min of
-        // runway per topup. Must fire more often than that or batches die
-        // between cycles (see commit 598be00 and related debug session).
-        "crons": ["* * * * *"]
+        // Gnosis ~5s blocks; hourly cron matches the live schedule.
+        "crons": ["0 * * * *"]
       }
     }
   }
