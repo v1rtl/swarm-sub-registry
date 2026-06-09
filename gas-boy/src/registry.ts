@@ -2,13 +2,16 @@ import {
   createPublicClient,
   createWalletClient,
   http,
+  webSocket,
+  fallback,
   type Hex,
   type PublicClient,
   type WalletClient,
   type Chain,
   type Account,
+  type Transport,
 } from "viem";
-import { sepolia, foundry } from "viem/chains";
+import { sepolia, foundry, gnosis } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 import { registryAbi, postageAbi } from "./abi";
 
@@ -40,9 +43,32 @@ export interface RunResult {
 // anvil_setCode; live Sepolia ships it natively.
 const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
 
+// Free public Gnosis-mainnet RPCs used as automatic fallbacks behind the
+// configured env.RPC_URL. The viem `fallback` transport rotates to the next
+// endpoint whenever one errors (rate limit, 5xx, network) or ranks too slow,
+// so a single throttled provider (e.g. 1rpc.io hitting its usage cap) no
+// longer takes the whole cron cycle down. Order here is the initial
+// preference; viem re-ranks by latency when `rank` is enabled.
+const GNOSIS_FALLBACK_RPCS = [
+  "https://gnosis-rpc.publicnode.com",
+  "wss://gnosis-rpc.publicnode.com",
+  "https://public-gno-mainnet.fastnode.io",
+  "https://gnosis.drpc.org",
+  "https://gnosis.oat.farm",
+  "https://gnosis.api.onfinality.io/public",
+  "https://xdai.fairdatasociety.org",
+] as const;
+
 function buildChain(env: Env): Chain {
   const id = Number(env.CHAIN_ID);
-  const base = id === 11155111 ? sepolia : id === 31337 ? foundry : null;
+  const base =
+    id === 11155111
+      ? sepolia
+      : id === 31337
+        ? foundry
+        : id === 100
+          ? gnosis
+          : null;
   if (!base) throw new Error(`unsupported CHAIN_ID: ${env.CHAIN_ID}`);
   return {
     ...base,
@@ -54,6 +80,44 @@ function buildChain(env: Env): Chain {
   };
 }
 
+/**
+ * One transport per URL. `wss://` / `ws://` → webSocket, else → http.
+ * `key` keeps fallback ranking/error logs readable per endpoint.
+ */
+function transportForUrl(url: string): Transport {
+  const isWs = url.startsWith("wss://") || url.startsWith("ws://");
+  return isWs
+    ? webSocket(url, { key: url, retryCount: 0 })
+    : http(url, { key: url, retryCount: 0 });
+}
+
+/**
+ * Build a resilient transport: the configured env.RPC_URL first, then the
+ * free Gnosis fallbacks (chain 100 only), de-duplicated. For other chains we
+ * just use env.RPC_URL. viem's `fallback` advances to the next transport on
+ * error and (with `rank`) periodically reorders by latency/stability so a
+ * dead or throttled endpoint is demoted automatically.
+ */
+function buildTransport(env: Env): Transport {
+  const id = Number(env.CHAIN_ID);
+  const urls = [env.RPC_URL];
+  if (id === 100) {
+    for (const u of GNOSIS_FALLBACK_RPCS) urls.push(u);
+  }
+  const seen = new Set<string>();
+  const unique = urls.filter((u) => u && !seen.has(u) && seen.add(u));
+  const transports = unique.map(transportForUrl);
+  if (transports.length === 1) return transports[0]!;
+  return fallback(transports, {
+    // Try each endpoint up to twice before moving on; viem retries with
+    // backoff within a transport, then the fallback advances.
+    retryCount: 2,
+    // Re-rank endpoints by latency/stability so a throttled or slow
+    // provider (1rpc.io over quota, etc.) sinks to the bottom over time.
+    rank: { interval: 60_000, sampleCount: 5 },
+  });
+}
+
 function buildClients(env: Env): {
   publicClient: PublicClient;
   walletClient: WalletClient;
@@ -61,7 +125,7 @@ function buildClients(env: Env): {
   chain: Chain;
 } {
   const chain = buildChain(env);
-  const transport = http(env.RPC_URL);
+  const transport = buildTransport(env);
   const publicClient = createPublicClient({ chain, transport });
   const account = privateKeyToAccount(env.PRIVATE_KEY as Hex);
   const walletClient = createWalletClient({ chain, transport, account });
@@ -255,9 +319,22 @@ export async function runCycle(env: Env): Promise<RunResult> {
     };
   }
 
-  const multicallErr = await assertMulticall3(publicClient);
-  if (multicallErr) {
-    return { ok: false, error: multicallErr, durationMs: duration() };
+  // Pre-flight Multicall3 probe. Wrapped: assertMulticall3 only handled the
+  // "bytecode absent" case, so a raw RPC rejection here (all fallbacks down,
+  // rate limits, etc.) would escape runCycle's later try/catch blocks and
+  // throw straight out of scheduled() — exactly the alarm-storm path the
+  // handler comment warns against. Capture it into RunResult instead.
+  try {
+    const multicallErr = await assertMulticall3(publicClient);
+    if (multicallErr) {
+      return { ok: false, error: multicallErr, durationMs: duration() };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: `multicall3 probe failed: ${err instanceof Error ? err.message : String(err)}`,
+      durationMs: duration(),
+    };
   }
 
   const result: RunResult = { ok: true, durationMs: 0 };
