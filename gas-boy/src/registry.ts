@@ -42,28 +42,23 @@ export interface RunResult {
 }
 
 // Supported chains. viem's definitions already include the canonical
-// Multicall3 deployment, so there's nothing to inject.
-const CHAINS: Record<number, Chain> = {
-  [gnosis.id]: gnosis,
-  [sepolia.id]: sepolia,
+// Multicall3 deployment, so there's nothing to inject. `fallbacks` are free
+// public RPCs tried (via viem's `fallback`) behind the configured RPC_URL so
+// one throttled provider can't stall a cycle; built once at module scope.
+const CHAINS: Record<number, { chain: Chain; fallbacks: Transport[] }> = {
+  [gnosis.id]: {
+    chain: gnosis,
+    fallbacks: [
+      http("https://gnosis-rpc.publicnode.com", { retryCount: 0 }),
+      webSocket("wss://gnosis-rpc.publicnode.com", { retryCount: 0 }),
+      http("https://gnosis.drpc.org", { retryCount: 0 }),
+      http("https://gnosis.oat.farm", { retryCount: 0 }),
+      http("https://gnosis.api.onfinality.io/public", { retryCount: 0 }),
+      http("https://xdai.fairdatasociety.org", { retryCount: 0 }),
+    ],
+  },
+  [sepolia.id]: { chain: sepolia, fallbacks: [] },
 };
-
-// Free public Gnosis-mainnet RPCs used as automatic fallbacks behind the
-// configured env.RPC_URL. viem's `fallback` rotates to the next endpoint on
-// error and re-ranks by latency, so one throttled provider can't stall a cycle.
-const GNOSIS_FALLBACK_RPCS = [
-  "https://gnosis-rpc.publicnode.com",
-  "wss://gnosis-rpc.publicnode.com",
-  "https://gnosis.drpc.org",
-  "https://gnosis.oat.farm",
-  "https://gnosis.api.onfinality.io/public",
-  "https://xdai.fairdatasociety.org",
-];
-
-const transportFor = (url: string): Transport =>
-  /^wss?:\/\//.test(url)
-    ? webSocket(url, { key: url, retryCount: 0 })
-    : http(url, { key: url, retryCount: 0 });
 
 function buildClients(env: Env): {
   publicClient: PublicClient;
@@ -71,26 +66,23 @@ function buildClients(env: Env): {
   account: Account;
   chain: Chain;
 } {
-  const id = Number(env.CHAIN_ID);
-  const base = CHAINS[id];
-  if (!base) throw new Error(`unsupported CHAIN_ID: ${env.CHAIN_ID}`);
+  const config = CHAINS[Number(env.CHAIN_ID)];
+  if (!config) throw new Error(`unsupported CHAIN_ID: ${env.CHAIN_ID}`);
   const chain: Chain = {
-    ...base,
+    ...config.chain,
     rpcUrls: { default: { http: [env.RPC_URL] } },
   };
 
-  const urls = [
-    env.RPC_URL,
-    ...(id === gnosis.id ? GNOSIS_FALLBACK_RPCS : []),
-  ].filter((u, i, a) => u && a.indexOf(u) === i);
-  const transports = urls.map(transportFor);
-  const transport =
-    transports.length === 1
-      ? transports[0]!
-      : fallback(transports, {
-          retryCount: 2,
-          rank: { interval: 60_000, sampleCount: 5 },
-        });
+  // Only the primary transport depends on the runtime RPC_URL binding.
+  const primary = /^wss?:\/\//.test(env.RPC_URL)
+    ? webSocket(env.RPC_URL, { retryCount: 0 })
+    : http(env.RPC_URL, { retryCount: 0 });
+  const transport = config.fallbacks.length
+    ? fallback([primary, ...config.fallbacks], {
+        retryCount: 2,
+        rank: { interval: 60_000, sampleCount: 5 },
+      })
+    : primary;
 
   const account = privateKeyToAccount(env.PRIVATE_KEY as Hex);
   return {
