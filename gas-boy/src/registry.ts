@@ -18,6 +18,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { registryAbi, postageAbi } from "./abi";
 
 export interface Env {
+  // HTTP(S) RPC endpoint, tried first ahead of the static per-chain fallbacks.
   RPC_URL: string;
   CHAIN_ID: string;
   REGISTRY_ADDRESS: `0x${string}`;
@@ -59,7 +60,15 @@ const CHAINS: Record<number, { chain: Chain; fallbacks: Transport[] }> = {
       http("https://xdai.fairdatasociety.org", { retryCount: 0 }),
     ],
   },
-  [sepolia.id]: { chain: sepolia, fallbacks: [] },
+  [sepolia.id]: {
+    chain: sepolia,
+    fallbacks: [
+      http("https://eth-sepolia-testnet.api.pocket.network", { retryCount: 0 }),
+      http("https://sepolia.drpc.org", { retryCount: 0 }),
+      webSocket("wss://sepolia.gateway.tenderly.co", { retryCount: 0 }),
+      http("https://eth-sepolia.api.onfinality.io/public", { retryCount: 0 }),
+    ],
+  },
 };
 
 function buildClients(env: Env): {
@@ -75,10 +84,9 @@ function buildClients(env: Env): {
     rpcUrls: { default: { http: [env.RPC_URL] } },
   };
 
-  // Only the primary transport depends on the runtime RPC_URL binding.
-  const primary = /^wss?:\/\//.test(env.RPC_URL)
-    ? webSocket(env.RPC_URL, { retryCount: 0 })
-    : http(env.RPC_URL, { retryCount: 0 });
+  // Primary transport is the runtime RPC_URL binding (HTTP only); the static
+  // per-chain fallbacks sit behind it.
+  const primary = http(env.RPC_URL, { retryCount: 0 });
   const transport = config.fallbacks.length
     ? fallback([primary, ...config.fallbacks], {
         retryCount: 2,
@@ -199,20 +207,22 @@ async function filterVolumes(
  */
 export async function runCycle(env: Env): Promise<RunResult> {
   const started = Date.now();
-  const pageSize = env.PAGE_SIZE ? Number(env.PAGE_SIZE) : 100;
   const registry = env.REGISTRY_ADDRESS;
-  const postage = env.POSTAGE_ADDRESS;
 
   // Run the cycle and stamp durationMs once, regardless of how it returns.
   // Never throws — errors collapse into an { ok: false } result.
   const run = async (): Promise<Omit<RunResult, "durationMs">> => {
     const { publicClient, walletClient, account, chain } = buildClients(env);
 
-    const { volumes, pages } = await collectActiveVolumes(publicClient, registry, pageSize);
+    const { volumes, pages } = await collectActiveVolumes(
+      publicClient,
+      registry,
+      env.PAGE_SIZE ? Number(env.PAGE_SIZE) : 100,
+    );
     const base = { ok: true, activeCount: volumes.length, pagesRead: pages };
     if (volumes.length === 0) return { ...base, skipped: "no active volumes" };
 
-    const { due, dead } = await filterVolumes(publicClient, postage, registry, volumes);
+    const { due, dead } = await filterVolumes(publicClient, env.POSTAGE_ADDRESS, registry, volumes);
     const ids = [...due, ...dead].map((v) => v.volumeId);
     const counts = { ...base, dueCount: due.length, deadCount: dead.length };
     if (ids.length === 0) return { ...counts, skipped: "no due or dead volumes" };
