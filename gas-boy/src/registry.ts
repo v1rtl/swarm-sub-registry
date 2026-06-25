@@ -205,37 +205,23 @@ async function filterVolumes(
  */
 export async function runCycle(env: Env): Promise<RunResult> {
   const started = Date.now();
-  const duration = () => Date.now() - started;
   const pageSize = env.PAGE_SIZE ? Number(env.PAGE_SIZE) : 100;
   const registry = env.REGISTRY_ADDRESS;
   const postage = env.POSTAGE_ADDRESS;
 
-  try {
+  // Run the cycle and stamp durationMs once, regardless of how it returns.
+  // Never throws — errors collapse into an { ok: false } result.
+  const run = async (): Promise<Omit<RunResult, "durationMs">> => {
     const { publicClient, walletClient, account, chain } = buildClients(env);
-    const result: RunResult = { ok: true, durationMs: 0 };
 
-    const { volumes, pages } = await collectActiveVolumes(
-      publicClient,
-      registry,
-      pageSize,
-    );
-    result.activeCount = volumes.length;
-    result.pagesRead = pages;
-    if (volumes.length === 0) {
-      result.skipped = "no active volumes";
-      result.durationMs = duration();
-      return result;
-    }
+    const { volumes, pages } = await collectActiveVolumes(publicClient, registry, pageSize);
+    const base = { ok: true, activeCount: volumes.length, pagesRead: pages };
+    if (volumes.length === 0) return { ...base, skipped: "no active volumes" };
 
     const { due, dead } = await filterVolumes(publicClient, postage, registry, volumes);
-    result.dueCount = due.length;
-    result.deadCount = dead.length;
     const ids = [...due, ...dead].map((v) => v.volumeId);
-    if (ids.length === 0) {
-      result.skipped = "no due or dead volumes";
-      result.durationMs = duration();
-      return result;
-    }
+    const counts = { ...base, dueCount: due.length, deadCount: dead.length };
+    if (ids.length === 0) return { ...counts, skipped: "no due or dead volumes" };
 
     const { request } = await publicClient.simulateContract({
       address: registry,
@@ -251,21 +237,19 @@ export async function runCycle(env: Env): Promise<RunResult> {
       ...request,
       gas: gasBudget < 15_000_000n ? gasBudget : 15_000_000n,
     });
-    const receipt = await publicClient.waitForTransactionReceipt({
-      hash,
-      timeout: 60_000,
-    });
-    result.txHash = hash;
-    result.blockNumber = receipt.blockNumber.toString();
-    result.gasUsed = receipt.gasUsed.toString();
-    result.ok = receipt.status === "success";
-    result.durationMs = duration();
-    return result;
-  } catch (err) {
+    const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
     return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs: duration(),
+      ...counts,
+      ok: receipt.status === "success",
+      txHash: hash,
+      blockNumber: receipt.blockNumber.toString(),
+      gasUsed: receipt.gasUsed.toString(),
     };
-  }
+  };
+
+  const result = await run().catch((err) => ({
+    ok: false,
+    error: err instanceof Error ? err.message : String(err),
+  }));
+  return { ...result, durationMs: Date.now() - started };
 }
