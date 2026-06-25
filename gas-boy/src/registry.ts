@@ -41,6 +41,8 @@ export interface RunResult {
   durationMs: number;
 }
 
+const bigMin = (a: bigint, b: bigint): bigint => (a < b ? a : b);
+
 // Supported chains. viem's definitions already include the canonical
 // Multicall3 deployment, so there's nothing to inject. `fallbacks` are free
 // public RPCs tried (via viem's `fallback`) behind the configured RPC_URL so
@@ -224,11 +226,8 @@ export async function runCycle(env: Env): Promise<RunResult> {
       chain,
     });
     // Gas budget: 300k base + 250k per id, capped at 15M.
-    const gasBudget = 300_000n + 250_000n * BigInt(ids.length);
-    const hash = await walletClient.writeContract({
-      ...request,
-      gas: gasBudget < 15_000_000n ? gasBudget : 15_000_000n,
-    });
+    const gas = bigMin(300_000n + 250_000n * BigInt(ids.length), 15_000_000n);
+    const hash = await walletClient.writeContract({ ...request, gas });
     const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
     return {
       ...counts,
