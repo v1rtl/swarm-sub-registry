@@ -4,6 +4,7 @@ import {
   http,
   webSocket,
   fallback,
+  zeroAddress,
   type Hex,
   type PublicClient,
   type WalletClient,
@@ -178,26 +179,22 @@ async function filterVolumes(
   });
 
   const target = lastPrice * graceBlocks;
-  const zeroAddr = "0x0000000000000000000000000000000000000000";
-
   const due: VolumeView[] = [];
   const dead: VolumeView[] = [];
-  for (let i = 0; i < volumes.length; ++i) {
-    const v = volumes[i]!;
-    const [owner, depth, , , normalisedBalance] = batches[i]!;
 
-    const missing = owner === zeroAddr;
-    const expired = !missing && normalisedBalance <= out;
-    const depthMismatch = !missing && depth !== v.depth;
-    const ownerMismatch =
-      !missing && owner.toLowerCase() !== v.chunkSigner.toLowerCase();
+  volumes.forEach((v, i) => {
+    const [owner, depth, , , balance] = batches[i]!;
+    const live = owner !== zeroAddress;
+    const isDead =
+      !live ||
+      balance <= out ||
+      depth !== v.depth ||
+      owner.toLowerCase() !== v.chunkSigner.toLowerCase();
 
-    if (missing || expired || depthMismatch || ownerMismatch) {
-      dead.push(v);
-    } else if (v.accountActive && normalisedBalance - out < target) {
-      due.push(v);
-    }
-  }
+    if (isDead) dead.push(v);
+    else if (v.accountActive && balance - out < target) due.push(v);
+  });
+
   return { due, dead };
 }
 
