@@ -1,8 +1,8 @@
-orion/junk
 .env
+
+# Bun workspace (packages/*, workers/*) hoists here. bun.lock is committed.
+node_modules/
 
 # Default output paths of scripts/plot-batch-balances.sh
 batch-balances.png
 batch-balances.tsv
-
-

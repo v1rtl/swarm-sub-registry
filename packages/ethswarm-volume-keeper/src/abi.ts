@@ -1,12 +1,10 @@
-// Minimal ABI surface of VolumeRegistry that gas-boy needs. Kept as
-// `as const` so viem can infer per-function return types.
+// Minimal ABI surface of VolumeRegistry + PostageStamp that a keeper needs.
+// Kept `as const` so viem can infer per-function argument and return types.
 //
-// Target contract: the rewritten VolumeRegistry per notes/DESIGN.md.
-// The old keepalive()/pruneDead()/isDue()/isDead() surface is gone —
-// the new API is:
-//   - getActiveVolumeCount() view
-//   - getActiveVolumes(offset, limit) view → VolumeView[]
-//   - trigger(bytes32[]) — batched, per-item try/catch inside the contract
+// Deliberately partial: this is a keeper, not a registry SDK. The singular
+// `trigger(bytes32)` overload is omitted — the batched form covers a single
+// id and keeping one signature keeps viem's overload inference simple.
+
 export const registryAbi = [
   {
     type: "function",
@@ -43,6 +41,38 @@ export const registryAbi = [
   },
   {
     type: "function",
+    name: "getVolume",
+    stateMutability: "view",
+    inputs: [{ type: "bytes32", name: "volumeId" }],
+    outputs: [
+      {
+        type: "tuple",
+        name: "",
+        components: [
+          { name: "volumeId", type: "bytes32" },
+          { name: "owner", type: "address" },
+          { name: "payer", type: "address" },
+          { name: "chunkSigner", type: "address" },
+          { name: "createdAt", type: "uint64" },
+          { name: "ttlExpiry", type: "uint64" },
+          { name: "depth", type: "uint8" },
+          { name: "status", type: "uint8" },
+          { name: "accountActive", type: "bool" },
+        ],
+      },
+    ],
+  },
+  // Constructor-immutable wiring, read once and cached: the PostageStamp
+  // address is discovered here rather than configured.
+  {
+    type: "function",
+    name: "postage",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
     name: "graceBlocks",
     stateMutability: "view",
     inputs: [],
@@ -55,7 +85,14 @@ export const registryAbi = [
     inputs: [{ type: "bytes32[]", name: "volumeIds" }],
     outputs: [],
   },
-  // Events we care about for log decoding.
+  {
+    type: "function",
+    name: "reap",
+    stateMutability: "nonpayable",
+    inputs: [{ type: "bytes32", name: "volumeId" }],
+    outputs: [],
+  },
+  // Events decoded off the trigger receipt to explain per-volume outcomes.
   {
     type: "event",
     name: "Toppedup",
@@ -83,7 +120,7 @@ export const registryAbi = [
   },
 ] as const;
 
-// PostageStamp subset — used by the client-side due/dead filter.
+// PostageStamp subset — feeds the client-side due/dead triage.
 export const postageAbi = [
   {
     type: "function",
@@ -114,3 +151,21 @@ export const postageAbi = [
     outputs: [{ type: "uint64" }],
   },
 ] as const;
+
+/** Volume.status values (VolumeRegistry.sol). */
+export const VOLUME_STATUS = { active: 1, retired: 2 } as const;
+
+/** `VolumeRetired(volumeId, reason)` reason codes, decoded to names. */
+export const RETIRE_REASONS: Record<number, string> = {
+  1: "OwnerDeleted",
+  2: "VolumeExpired",
+  3: "BatchDied",
+  4: "DepthChanged",
+  5: "BatchOwnerMismatch",
+};
+
+/** `TopupSkipped(volumeId, reason)` reason codes, decoded to names. */
+export const SKIP_REASONS: Record<number, string> = {
+  1: "NoAuth",
+  2: "PaymentFailed",
+};

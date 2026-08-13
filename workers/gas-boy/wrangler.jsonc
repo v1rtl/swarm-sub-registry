@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gas-boy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Top-level config is what `wrangler dev` uses: the Sepolia testnet
+  // deployment, so a local run does something real out of the box.
+  //
+  // PRIVATE_KEY is a secret, never a var — `.dev.vars` locally,
+  // `wrangler secret put PRIVATE_KEY --env <env>` for a deploy. RPC_URL is
+  // required and set the same way (it usually embeds an API key); no endpoints
+  // are shipped with this worker.
+  //
+  // POSTAGE_ADDRESS is deliberately absent: the keeper reads PostageStamp from
+  // the registry's own immutable, so it cannot be set to the wrong thing.
+  "vars": {
+    "CHAIN_ID": "11155111",
+    "REGISTRY_ADDRESS": "0x3a99b4b52a4bd75760667219ea93c627051b1af8"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  "env": {
+    // Sepolia — graceBlocks = 12 (~2.4 min), so the minute cron is the floor
+    // that keeps volumes alive.
+    "sepolia": {
+      "vars": {
+        "CHAIN_ID": "11155111",
+        "REGISTRY_ADDRESS": "0x3a99b4b52a4bd75760667219ea93c627051b1af8"
+      },
+      "triggers": {
+        "crons": ["* * * * *"]
+      }
+    },
+
+    // Gnosis Chain mainnet — graceBlocks = 17280 (~24 h @ 5 s blocks), so an
+    // hourly cycle leaves ~23 h of slack for missed runs.
+    "production": {
+      "vars": {
+        "CHAIN_ID": "100",
+        "REGISTRY_ADDRESS": "0x9639Ae4C7A8Fa9efE585738d516a3915DdD02aAD"
+      },
+      "triggers": {
+        "crons": ["0 * * * *"]
+      }
+    }
+  }
+}

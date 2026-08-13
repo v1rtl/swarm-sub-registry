@@ -1,0 +1,10 @@
+{
+  "name": "swarm-sub-registry",
+  "private": true,
+  "workspaces": ["packages/*", "workers/*"],
+  "scripts": {
+    "build": "bun run --filter 'ethswarm-volume-keeper' build",
+    "test": "bun test packages/",
+    "typecheck": "bun run --filter '*' typecheck"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "gas-boy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cron-driven Cloudflare Worker running ethswarm-volume-keeper against a VolumeRegistry deployment",
+  "scripts": {
+    "build:pkg": "cd ../../packages/ethswarm-volume-keeper && bun run build",
+    "dev": "bun run build:pkg && wrangler dev",
+    "deploy:sepolia": "bun run build:pkg && wrangler deploy --env sepolia",
+    "deploy:prod": "bun run build:pkg && wrangler deploy --env production",
+    "typecheck": "bun run build:pkg && tsc --noEmit"
+  },
+  "dependencies": {
+    "ethswarm-volume-keeper": "workspace:*",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250426.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^4.112.0"
+  }
+}

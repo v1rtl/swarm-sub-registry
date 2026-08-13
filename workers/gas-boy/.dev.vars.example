@@ -1,0 +1,30 @@
+# Copy to .dev.vars and fill in. Never commit .dev.vars.
+#
+# For a deploy these are secrets/vars set with wrangler, not this file:
+#   wrangler secret put PRIVATE_KEY --env production
+
+# The keeper EOA. Generate a fresh one — `cast wallet new` — and never reuse a
+# key from anywhere else, this file included. It only pays gas: it never holds
+# or moves BZZ and needs no authorization on the registry, so fund it with
+# xDAI (Gnosis) or test ETH (Sepolia) and nothing else.
+PRIVATE_KEY="0x<64 hex chars>"
+
+# Required. This worker ships no endpoints of its own — bring a reliable one.
+# Comma-separate several to fail over between them, tried in order.
+RPC_URL="https://..."
+
+# --- everything below is optional ---
+
+# Maintain only these volumes instead of the whole registry.
+# VOLUME_IDS="0x...,0x..."
+
+# Simulate without sending anything. Good for validating a new deployment.
+# DRY_RUN="true"
+
+# Log a warning when the keeper EOA's balance drops below this (wei).
+# MIN_BALANCE_WEI="100000000000000000"
+
+# Batching limits. Defaults: 50 ids per tx, 8 txs per cycle, 100 per read page.
+# MAX_IDS_PER_TX="50"
+# MAX_TX_PER_CYCLE="8"
+# PAGE_SIZE="100"

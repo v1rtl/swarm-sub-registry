@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // No runtime-specific @types in the published build. DOM supplies the
+    // ambient globals every target runtime provides (console, fetch, URL).
+    "types": [],
+    "lib": ["ES2022", "DOM"],
+    "declaration": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"]
+}
